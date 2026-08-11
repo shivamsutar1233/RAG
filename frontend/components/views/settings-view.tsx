@@ -39,6 +39,9 @@ export function SettingsView({ status, onRefresh }: Props) {
   const [embModel, setEmbModel] = useState("");
   const [routing, setRouting] = useState("semantic");
   const [reranker, setReranker] = useState("flashrank");
+  // "" means "grade with the chat model" — the backend's default.
+  const [evalProvider, setEvalProvider] = useState("");
+  const [evalModel, setEvalModel] = useState("");
   const [keys, setKeys] = useState<Record<string, string>>({});
 
   useEffect(() => {
@@ -55,6 +58,8 @@ export function SettingsView({ status, onRefresh }: Props) {
       setEmbModel(status.embedding_model ?? "");
       setRouting(status.routing_method);
       setReranker(status.reranker_provider);
+      setEvalProvider(status.eval_llm_provider ?? "");
+      setEvalModel(status.eval_llm_provider ? (status.eval_llm_model ?? "") : "");
       setKeys({});
       setResult(null);
     },
@@ -96,6 +101,8 @@ export function SettingsView({ status, onRefresh }: Props) {
         llm_model: llmModel,
         embedding_provider: embProvider,
         embedding_model: embModel,
+        eval_llm_provider: evalProvider,
+        eval_llm_model: evalProvider ? evalModel : "",
         ...Object.fromEntries(
           Object.entries(CREDENTIALS).map(([env, [field]]) => [
             field,
@@ -213,6 +220,54 @@ export function SettingsView({ status, onRefresh }: Props) {
                 </AlertDescription>
               </Alert>
             )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Evaluation judge</CardTitle>
+            <CardDescription>
+              Which model grades evaluation runs. Scoring costs roughly a dozen model
+              calls per question, so the model that is pleasant to chat with is often
+              the wrong one to grade with — and grading a model with itself is poor
+              methodology regardless of speed. Leave unset to use the chat model.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="grid grid-cols-1 gap-5 md:grid-cols-2">
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="eval-provider">Judge provider</Label>
+              <Select value={evalProvider} onValueChange={(v) => setEvalProvider(v ?? "")}>
+                <SelectTrigger id="eval-provider" className="w-full">
+                  <SelectValue placeholder="Same as chat model" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="">Same as chat model</SelectItem>
+                  {catalog?.chat.map((p) => (
+                    <SelectItem key={p.id} value={p.id}>
+                      {p.id}
+                      {p.requires_key && !p.key_configured ? " (key needed)" : ""}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="eval-model">
+                Judge model <span className="text-muted-foreground">(optional)</span>
+              </Label>
+              <Input
+                id="eval-model"
+                className="font-mono text-sm"
+                disabled={!evalProvider}
+                placeholder={
+                  evalProvider
+                    ? (catalog?.chat.find((p) => p.id === evalProvider)?.default_model ?? "")
+                    : "using the chat model"
+                }
+                value={evalModel}
+                onChange={(e) => setEvalModel(e.target.value)}
+              />
+            </div>
           </CardContent>
         </Card>
 

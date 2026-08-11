@@ -294,6 +294,9 @@ class GenerateTestSetRequest(BaseModel):
 
 class EvalRunRequest(BaseModel):
     testset: str
+    # Omitted means "every metric this test set supports". Naming a subset is the
+    # main cost lever a user has: each metric is several judge calls per question.
+    metrics: Optional[List[str]] = None
 
 
 class EvalRow(BaseModel):
@@ -326,6 +329,9 @@ class EvalRun(BaseModel):
     llm_model: Optional[str] = None
     embedding_provider: Optional[str] = None
     embedding_model: Optional[str] = None
+    # Which model produced the answers, when a separate judge graded them. Kept
+    # distinct from llm_model (the judge) so a scorecard says who did what.
+    answered_by: Optional[str] = None
     judge_warning: Optional[str] = None
     scores: dict = {}
     error: Optional[str] = None
@@ -343,6 +349,10 @@ class ConfigUpdateRequest(BaseModel):
     llm_model: Optional[str] = None
     embedding_provider: Optional[str] = None
     embedding_model: Optional[str] = None
+    # Optional separate judge for evaluation runs. An empty string clears it back
+    # to "use the chat model", which None cannot express.
+    eval_llm_provider: Optional[str] = None
+    eval_llm_model: Optional[str] = None
     # Credentials, applied to the process environment when supplied.
     openai_key: Optional[str] = None
     anthropic_key: Optional[str] = None
@@ -438,6 +448,10 @@ async def update_config(
             embedding_model=config.embedding_model,
             routing_method=config.routing_method,
             reranker_provider=config.reranker_provider,
+            # with_updates drops None, so omitting these keeps the saved judge
+            # while sending "" clears it back to the chat model.
+            eval_llm_provider=config.eval_llm_provider,
+            eval_llm_model=config.eval_llm_model,
             keys={
                 "OPENAI_API_KEY": config.openai_key,
                 "ANTHROPIC_API_KEY": config.anthropic_key,
@@ -1044,7 +1058,11 @@ def _run_eval_job(
 
 
 def _run_evaluation_background(
-    workspace: Workspace, testset_name: str, run_id: str, token: Optional[str]
+    workspace: Workspace,
+    testset_name: str,
+    run_id: str,
+    token: Optional[str],
+    metrics: Optional[List[str]] = None,
 ) -> None:
     def body(say, cancel) -> dict:
         from .evaluation import load_testset, run_evaluation
@@ -1053,7 +1071,13 @@ def _run_evaluation_background(
         config = load_user_config(workspace, token)
         pipeline = pipelines.get(workspace)
         return run_evaluation(
-            pipeline, config, testset, run_id=run_id, cancel=cancel, log=say
+            pipeline,
+            config,
+            testset,
+            run_id=run_id,
+            metrics=metrics,
+            cancel=cancel,
+            log=say,
         )
 
     _run_eval_job(workspace, run_id, token, "eval", body, testset=testset_name)
@@ -1201,7 +1225,12 @@ def trigger_evaluation(
 
     run_id = str(uuid.uuid4())
     background_tasks.add_task(
-        _run_evaluation_background, workspace, request.testset, run_id, user.token
+        _run_evaluation_background,
+        workspace,
+        request.testset,
+        run_id,
+        user.token,
+        request.metrics,
     )
     return {"status": "success", "run_id": run_id}
 

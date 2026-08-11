@@ -8,6 +8,8 @@ evaluation from the dashboard or `python evaluate.py`.
 import json
 import os
 import sys
+import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,6 +26,7 @@ from backend.evaluation import (  # noqa: E402
     _per_row_scores,
     judge_warning,
     parse_testset,
+    select_metrics,
 )
 from backend.evaluation import (
     TestSet as EvalTestSet,
@@ -31,7 +34,7 @@ from backend.evaluation import (
 from backend.evaluation import (
     testset_path as resolve_testset_path,
 )
-from backend.providers import ProviderConfig  # noqa: E402
+from backend.providers import ConfigError, ProviderConfig  # noqa: E402
 from backend.workspace import Workspace  # noqa: E402
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -232,3 +235,181 @@ def test_larger_local_judges_get_a_softer_caveat():
 
 def test_cloud_judges_are_not_flagged():
     assert judge_warning(_config("anthropic", "claude-opus-5")) is None
+
+
+# ── separate judge model ─────────────────────────────────────────────────────
+
+
+def test_for_evaluation_returns_self_when_no_judge_configured():
+    cfg = _config("ollama", "llama3.2:1b")
+    assert cfg.for_evaluation() is cfg
+
+
+def test_for_evaluation_swaps_the_llm_but_keeps_embeddings():
+    """Embeddings must not change: answer relevancy compares against the same
+    vector space the index was built in."""
+    cfg = ProviderConfig(
+        llm_provider="ollama",
+        llm_model="llama3.2:1b",
+        embedding_provider="ollama",
+        embedding_model="nomic-embed-text",
+        eval_llm_provider="gemini",
+        eval_llm_model="gemini-2.5-flash",
+        keys={"GOOGLE_API_KEY": "x"},
+    )
+    judge = cfg.for_evaluation()
+    assert (judge.llm_provider, judge.resolved_llm_model) == ("gemini", "gemini-2.5-flash")
+    assert judge.embedding_provider == "ollama"
+    assert judge.embedding_model == "nomic-embed-text"
+    # the original is untouched — it still answers with the chat model
+    assert cfg.llm_provider == "ollama"
+
+
+def test_a_weak_chat_model_with_a_strong_judge_is_not_warned_about():
+    cfg = ProviderConfig(
+        llm_provider="ollama",
+        llm_model="llama3.2:1b",
+        eval_llm_provider="anthropic",
+        eval_llm_model="claude-opus-5",
+        keys={"ANTHROPIC_API_KEY": "x"},
+    )
+    assert judge_warning(cfg) is not None  # the chat model on its own is weak
+    assert judge_warning(cfg.for_evaluation()) is None  # but it is not the judge
+
+
+def test_unknown_judge_provider_is_rejected():
+    cfg = ProviderConfig(eval_llm_provider="nope")
+    with pytest.raises(ConfigError):
+        cfg.validate()
+
+
+def test_judge_provider_missing_its_key_is_rejected_up_front():
+    """Caught at save time, not after a run has already burned quota."""
+    cfg = ProviderConfig(eval_llm_provider="openai", keys={})
+    with pytest.raises(ConfigError, match="OPENAI_API_KEY"):
+        cfg.validate()
+
+
+# ── metric selection ─────────────────────────────────────────────────────────
+
+
+def test_select_metrics_defaults_to_everything_supported():
+    ts = EvalTestSet(name="t", items=[{"question": "q", "ground_truth": "a"}])
+    assert select_metrics(ts, None) == ALL_METRICS
+    assert select_metrics(ts, []) == ALL_METRICS
+
+
+def test_select_metrics_honours_a_subset():
+    ts = EvalTestSet(name="t", items=[{"question": "q", "ground_truth": "a"}])
+    assert select_metrics(ts, ["faithfulness", "context_recall"]) == (
+        "faithfulness",
+        "context_recall",
+    )
+
+
+def test_select_metrics_drops_ones_the_set_cannot_support():
+    """Asking for context recall without references is not worth failing a run
+    over — it simply is not computable."""
+    ts = EvalTestSet(name="t", items=[{"question": "q"}])
+    assert select_metrics(ts, ["faithfulness", "context_recall"]) == ("faithfulness",)
+
+
+def test_select_metrics_falls_back_when_nothing_requested_is_available():
+    ts = EvalTestSet(name="t", items=[{"question": "q"}])
+    assert select_metrics(ts, ["factual_correctness"]) == REFERENCE_FREE_METRICS
+
+
+def test_select_metrics_ignores_unknown_names():
+    ts = EvalTestSet(name="t", items=[{"question": "q"}])
+    assert select_metrics(ts, ["faithfulness", "not_a_metric"]) == ("faithfulness",)
+
+
+# ── parallel answering ───────────────────────────────────────────────────────
+
+
+def test_parallel_answering_preserves_order_and_records_failures(monkeypatch):
+    """Rows must line up with the test set regardless of completion order —
+    otherwise a scorecard shows one question's score against another's text.
+    The slowest question is answered first here, so any append-as-they-finish
+    implementation would reverse them."""
+    import time
+
+    import backend.evaluation as ev
+
+    questions = ["slow", "medium", "fast", "boom"]
+    delays = {"slow": 0.30, "medium": 0.15, "fast": 0.01, "boom": 0.0}
+
+    def fake_run_query(_pipeline, question, **_kw):
+        time.sleep(delays[question])
+        if question == "boom":
+            raise RuntimeError("pipeline exploded")
+        return SimpleNamespace(
+            answer=f"answer to {question}",
+            context_docs=[SimpleNamespace(page_content=f"ctx {question}")],
+            route="standard",
+            grounded=True,
+            latency_ms=1,
+        )
+
+    monkeypatch.setattr(ev, "run_query", fake_run_query)
+    monkeypatch.setattr(ev, "_score", lambda *a, **k: None)
+    monkeypatch.setattr(ev, "EVAL_ANSWER_WORKERS", 4)
+
+    ts = EvalTestSet(name="t", items=[{"question": q} for q in questions])
+    report = ev.run_evaluation(
+        pipeline={}, config=ProviderConfig(), testset=ts, run_id="r"
+    )
+
+    assert report["status"] == "completed"
+    assert [r["question"] for r in report["rows"]] == questions
+    assert report["rows"][0]["answer"] == "answer to slow"
+    assert report["rows"][2]["contexts"] == ["ctx fast"]
+    # a failed question is recorded, not fatal, and carries no score
+    assert "pipeline exploded" in report["rows"][3]["error"]
+    assert report["rows"][3]["answer"] is None
+
+
+def test_cancelling_before_the_run_starts_answers_nothing(monkeypatch):
+    import backend.evaluation as ev
+
+    called = []
+    monkeypatch.setattr(
+        ev, "run_query", lambda *a, **k: called.append(1) or SimpleNamespace()
+    )
+    monkeypatch.setattr(ev, "EVAL_ANSWER_WORKERS", 1)
+
+    cancel = threading.Event()
+    cancel.set()
+    ts = EvalTestSet(name="t", items=[{"question": "q"}])
+    report = ev.run_evaluation(
+        pipeline={}, config=ProviderConfig(), testset=ts, run_id="r", cancel=cancel
+    )
+
+    assert report["status"] == "cancelled"
+    assert called == []
+
+
+def test_run_records_both_the_answering_model_and_the_judge(monkeypatch):
+    import backend.evaluation as ev
+
+    monkeypatch.setattr(ev, "_score", lambda *a, **k: None)
+    monkeypatch.setattr(
+        ev,
+        "run_query",
+        lambda *a, **k: SimpleNamespace(
+            answer="a", context_docs=[], route="simple", grounded=True, latency_ms=1
+        ),
+    )
+    cfg = ProviderConfig(
+        llm_provider="ollama",
+        llm_model="llama3.2:1b",
+        eval_llm_provider="anthropic",
+        eval_llm_model="claude-opus-5",
+        keys={"ANTHROPIC_API_KEY": "x"},
+    )
+    ts = EvalTestSet(name="t", items=[{"question": "q"}])
+    report = ev.run_evaluation(pipeline={}, config=cfg, testset=ts, run_id="r")
+
+    assert report["llm_model"] == "claude-opus-5"          # who judged
+    assert report["answered_by"] == "ollama/llama3.2:1b"   # who answered
+    assert report["judge_warning"] is None

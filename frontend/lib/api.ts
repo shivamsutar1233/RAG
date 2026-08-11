@@ -37,6 +37,9 @@ export interface StatusResponse {
   embedding_provider?: string;
   embedding_model?: string;
   embedding_key_configured?: boolean;
+  eval_llm_provider?: string;
+  eval_llm_model?: string;
+  eval_key_configured?: boolean;
   error?: string;
 }
 
@@ -95,6 +98,19 @@ export const METRIC_HELP: Record<EvalMetric, string> = {
   factual_correctness: "Does the answer agree with the reference answer?",
 };
 
+/** Roughly how many LLM calls each metric costs per question. RAGAS does not
+ *  make one call per metric: faithfulness extracts statements then verifies
+ *  them, context precision grades every retrieved chunk separately, and factual
+ *  correctness decomposes both the answer and the reference into claims.
+ *  Used only to warn before a run — not a billing figure. */
+export const METRIC_CALL_COST: Record<EvalMetric, number> = {
+  faithfulness: 2,
+  answer_relevancy: 1,
+  context_precision: 3,
+  context_recall: 1,
+  factual_correctness: 4,
+};
+
 export interface TestSetSummary {
   name: string;
   source: string;
@@ -130,6 +146,8 @@ export interface EvalRun {
   llm_model: string | null;
   embedding_provider: string | null;
   embedding_model: string | null;
+  /** Which model produced the answers, when a separate judge graded them. */
+  answered_by: string | null;
   /** Set when the judge model is too weak to be trusted; shown as a banner. */
   judge_warning: string | null;
   scores: Partial<Record<EvalMetric, number | null>>;
@@ -162,6 +180,9 @@ export interface ConfigPayload {
   llm_model?: string;
   embedding_provider?: string;
   embedding_model?: string;
+  /** Separate judge for evaluation. "" clears it back to the chat model. */
+  eval_llm_provider?: string;
+  eval_llm_model?: string;
   openai_key?: string | null;
   anthropic_key?: string | null;
   google_key?: string | null;
@@ -381,11 +402,13 @@ export const api = {
       body: JSON.stringify({ name, size }),
     }),
 
-  runEval: (testset: string) =>
+  /** Omit `metrics` to score everything the test set supports. Naming a subset
+   *  is the main cost lever: each metric is several judge calls per question. */
+  runEval: (testset: string, metrics?: EvalMetric[]) =>
     request<{ status: string; run_id: string }>("/api/eval/run", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ testset }),
+      body: JSON.stringify({ testset, metrics }),
     }),
 
   listEvalRuns: () => request<EvalRun[]>("/api/eval/runs"),

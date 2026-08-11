@@ -71,9 +71,31 @@ class ProviderConfig:
     keys: dict[str, str] = field(default_factory=dict)
     ollama_base_url: str = "http://localhost:11434"
 
+    # Optional separate model for evaluation. Empty means "use the chat model".
+    # Scoring costs roughly a dozen LLM calls per question, so the model that is
+    # pleasant to chat with is often the wrong one to grade with — and grading a
+    # model with itself is poor methodology regardless of speed.
+    eval_llm_provider: str = ""
+    eval_llm_model: str = ""
+
     @property
     def resolved_llm_model(self) -> str:
         return self.llm_model or CHAT_PROVIDERS[self.llm_provider]["model"]
+
+    def for_evaluation(self) -> "ProviderConfig":
+        """This config with the judge model swapped in, if one is configured.
+
+        Embeddings are deliberately left alone: answer relevancy compares against
+        the same vector space the index was built in, and swapping it would make
+        that score incomparable to the retrieval it is grading.
+        """
+        if not self.eval_llm_provider:
+            return self
+        return replace(
+            self,
+            llm_provider=self.eval_llm_provider,
+            llm_model=self.eval_llm_model,
+        )
 
     @property
     def resolved_embedding_model(self) -> str:
@@ -101,15 +123,26 @@ class ProviderConfig:
                 f"Unknown embedding provider '{self.embedding_provider}'. "
                 f"Choose one of: {', '.join(sorted(EMBEDDING_PROVIDERS))}."
             )
+        if self.eval_llm_provider and self.eval_llm_provider not in CHAT_PROVIDERS:
+            raise ConfigError(
+                f"Unknown evaluation LLM provider '{self.eval_llm_provider}'. "
+                f"Choose one of: {', '.join(sorted(CHAT_PROVIDERS))}."
+            )
         if self.routing_method not in ("semantic", "llm"):
             raise ConfigError("routing_method must be 'semantic' or 'llm'.")
         if self.reranker_provider not in ("flashrank", "cohere"):
             raise ConfigError("reranker_provider must be 'flashrank' or 'cohere'.")
 
-        for provider, registry, label in (
+        checks = [
             (self.llm_provider, CHAT_PROVIDERS, "LLM"),
             (self.embedding_provider, EMBEDDING_PROVIDERS, "embedding"),
-        ):
+        ]
+        if self.eval_llm_provider:
+            # Caught here rather than mid-run: a missing key would otherwise fail
+            # every row of an evaluation the user has already paid to start.
+            checks.append((self.eval_llm_provider, CHAT_PROVIDERS, "evaluation"))
+
+        for provider, registry, label in checks:
             env_name = registry[provider]["key"]
             if env_name and not (self.keys.get(env_name) or "").strip():
                 raise ConfigError(
@@ -131,6 +164,11 @@ class ProviderConfig:
             ),
             "routing_method": self.routing_method,
             "reranker_provider": self.reranker_provider,
+            "eval_llm_provider": self.eval_llm_provider,
+            "eval_llm_model": self.for_evaluation().resolved_llm_model,
+            "eval_key_configured": _has_key(
+                self.for_evaluation(), self.for_evaluation().llm_provider, CHAT_PROVIDERS
+            ),
         }
 
     def describe(self) -> str:
@@ -173,6 +211,8 @@ def env_defaults() -> ProviderConfig:
         embedding_model=(os.getenv("EMBEDDING_MODEL") or "").strip(),
         routing_method=(os.getenv("ROUTING_METHOD") or "semantic").strip().lower(),
         reranker_provider=(os.getenv("RERANKER_PROVIDER") or "flashrank").strip().lower(),
+        eval_llm_provider=(os.getenv("EVAL_LLM_PROVIDER") or "").strip().lower(),
+        eval_llm_model=(os.getenv("EVAL_LLM_MODEL") or "").strip(),
         keys=keys,
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
     )

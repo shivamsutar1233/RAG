@@ -7,7 +7,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import {
-  API_BASE, ApiError, METRIC_HELP, METRIC_LABELS, api,
+  API_BASE, ApiError, METRIC_CALL_COST, METRIC_HELP, METRIC_LABELS, api,
   type EvalMetric, type EvalRun, type EvalRunDetail, type StatusResponse, type TestSetSummary,
 } from "@/lib/api";
 import { accessToken } from "@/lib/supabase";
@@ -109,9 +109,11 @@ export function EvaluationView({ status, sessions, active }: Props) {
   const [openRow, setOpenRow] = useState<number | null>(null);
   const [log, setLog] = useState<LogLine[]>([]);
   const [busy, setBusy] = useState(false);
-  const [genSize, setGenSize] = useState(8);
+  const [genSize, setGenSize] = useState(5);
   const [genName, setGenName] = useState("");
   const [loaded, setLoaded] = useState(false);
+  // null means "everything this set supports" — the backend's own default.
+  const [chosenMetrics, setChosenMetrics] = useState<EvalMetric[] | null>(null);
 
   const fileRef = useRef<HTMLInputElement>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
@@ -240,7 +242,7 @@ export function EvaluationView({ status, sessions, active }: Props) {
     guard(async () => {
       if (!selectedSet) throw new ApiError("Pick a test set first.", 400);
       setLog([{ text: "Starting evaluation...", tone: "info" }]);
-      await api.runEval(selectedSet);
+      await api.runEval(selectedSet, chosenMetrics ?? undefined);
     });
 
   const startGeneration = () =>
@@ -292,6 +294,30 @@ export function EvaluationView({ status, sessions, active }: Props) {
 
   const chosen = testsets.find((t) => t.name === selectedSet);
   const shownMetrics = detail?.metrics?.length ? detail.metrics : METRIC_ORDER;
+
+  // Metrics actually available for the selected set, and the subset that will run.
+  const availableMetrics = chosen?.metrics ?? METRIC_ORDER;
+  const runMetrics = chosenMetrics
+    ? availableMetrics.filter((m) => chosenMetrics.includes(m))
+    : availableMetrics;
+  const effectiveMetrics = runMetrics.length ? runMetrics : availableMetrics;
+
+  // RAGAS issues several judge calls per metric per question, plus the RAG query
+  // itself. Surfaced before the run because on a rate-limited tier this number,
+  // not the question count, is what decides whether the run finishes.
+  const estimatedCalls =
+    (chosen?.size ?? 0) *
+    (effectiveMetrics.reduce((sum, m) => sum + METRIC_CALL_COST[m], 0) + 6);
+
+  const toggleMetric = (metric: EvalMetric) =>
+    setChosenMetrics((current) => {
+      const base = current ?? availableMetrics;
+      const next = base.includes(metric)
+        ? base.filter((m) => m !== metric)
+        : [...base, metric];
+      // Deselecting everything means "all" again rather than an unrunnable run.
+      return next.length ? next : null;
+    });
   const evalRuns = useMemo(
     () => runs.filter((r) => r.kind === "eval" && r.status === "completed"),
     [runs],
@@ -456,11 +482,58 @@ export function EvaluationView({ status, sessions, active }: Props) {
               )}
             </div>
 
-            {chosen && !chosen.has_references && (
-              <p className="text-muted-foreground text-xs">
-                This set has no reference answers, so context recall and factual
-                correctness are skipped.
-              </p>
+            {chosen && (
+              <div className="space-y-2">
+                <Label>Metrics</Label>
+                <div className="flex flex-wrap gap-2">
+                  {METRIC_ORDER.map((metric) => {
+                    const supported = availableMetrics.includes(metric);
+                    const on = supported && effectiveMetrics.includes(metric);
+                    return (
+                      <button
+                        key={metric}
+                        type="button"
+                        disabled={!supported || !!activeRun}
+                        onClick={() => toggleMetric(metric)}
+                        title={
+                          supported
+                            ? METRIC_HELP[metric]
+                            : "Needs reference answers in the test set."
+                        }
+                        className={cn(
+                          "rounded-full border px-3 py-1 text-xs font-medium transition-colors",
+                          on
+                            ? "border-primary bg-primary/10 text-foreground"
+                            : "text-muted-foreground",
+                          !supported && "cursor-not-allowed opacity-40",
+                        )}
+                      >
+                        <span
+                          aria-hidden
+                          className="mr-1.5 inline-block size-2 rounded-full align-middle"
+                          style={{
+                            backgroundColor: on
+                              ? `var(--chart-${METRIC_ORDER.indexOf(metric) + 1})`
+                              : "var(--muted-foreground)",
+                          }}
+                        />
+                        {METRIC_LABELS[metric]}
+                        <span className="text-muted-foreground ml-1.5">
+                          ~{METRIC_CALL_COST[metric]}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="text-muted-foreground text-xs">
+                  {chosen.has_references
+                    ? "Numbers are roughly how many LLM calls each metric costs per question."
+                    : "This set has no reference answers, so context recall and factual correctness cannot be computed."}{" "}
+                  Estimated <span className="tabular font-medium">~{estimatedCalls}</span>{" "}
+                  model calls for this run — check that against your provider&apos;s rate
+                  limit before starting.
+                </p>
+              </div>
             )}
 
             {(activeRun || log.length > 0) && (
@@ -492,8 +565,11 @@ export function EvaluationView({ status, sessions, active }: Props) {
               <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
                 <h2 className="text-lg font-semibold tracking-tight">Latest scorecard</h2>
                 <p className="text-muted-foreground text-xs">
-                  {detail.testset} · {detail.testset_size} questions · judged by{" "}
-                  {detail.llm_provider}/{detail.llm_model} · {timeAgo(detail.started_at)}
+                  {detail.testset} · {detail.testset_size} questions ·{" "}
+                  {detail.answered_by && detail.answered_by !== `${detail.llm_provider}/${detail.llm_model}`
+                    ? `answered by ${detail.answered_by}, judged by ${detail.llm_provider}/${detail.llm_model}`
+                    : `judged by ${detail.llm_provider}/${detail.llm_model}`}{" "}
+                  · {timeAgo(detail.started_at)}
                 </p>
               </div>
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">

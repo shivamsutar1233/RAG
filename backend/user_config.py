@@ -124,6 +124,8 @@ def load_user_config(
         embedding_model=stored.get("embedding_model", defaults.embedding_model),
         routing_method=stored.get("routing_method", defaults.routing_method),
         reranker_provider=stored.get("reranker_provider", defaults.reranker_provider),
+        eval_llm_provider=stored.get("eval_llm_provider", defaults.eval_llm_provider),
+        eval_llm_model=stored.get("eval_llm_model", defaults.eval_llm_model),
         keys=keys,
         ollama_base_url=defaults.ollama_base_url,
     )
@@ -150,6 +152,8 @@ def save_user_config(
         "embedding_model": config.embedding_model,
         "routing_method": config.routing_method,
         "reranker_provider": config.reranker_provider,
+        "eval_llm_provider": config.eval_llm_provider,
+        "eval_llm_model": config.eval_llm_model,
         "keys": {
             env_name: fernet.encrypt(value.encode()).decode()
             for env_name, value in config.keys.items()

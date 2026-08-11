@@ -33,10 +33,11 @@ import re
 import statistics
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -105,6 +106,17 @@ MAX_TESTSET_SIZE = int(os.getenv("MAX_TESTSET_SIZE", "50"))
 # silently drops that row's score. Generous by default; a cloud judge never gets
 # near it.
 EVAL_TIMEOUT_SECONDS = int(os.getenv("EVAL_TIMEOUT_SECONDS", "900"))
+
+# How many questions are answered at once. Answering is independent per question
+# and entirely I/O-bound, so this is the cheapest speed-up available — but it
+# multiplies the request rate, so it is capped by the same worker budget as
+# scoring and should stay at 1 on a rate-limited free tier.
+EVAL_ANSWER_WORKERS = int(os.getenv("EVAL_ANSWER_WORKERS", str(EVAL_MAX_WORKERS)))
+
+# Reverse-generated questions per answer for the answer-relevancy metric, one LLM
+# call each. RAGAS defaults to 3; 1 is usually indistinguishable in the aggregate
+# and cuts a third of that metric's cost.
+ANSWER_RELEVANCY_STRICTNESS = int(os.getenv("ANSWER_RELEVANCY_STRICTNESS", "1"))
 
 # Ollama's default is a 1B model. It cannot reliably produce the structured
 # judgements RAGAS asks for, and silently returns near-random scores rather than
@@ -436,7 +448,11 @@ def _build_metrics(names: tuple[str, ...]) -> tuple[list[Any], dict[str, str]]:
 
     builders: dict[str, Callable[[], Any]] = {
         "faithfulness": Faithfulness,
-        "answer_relevancy": ResponseRelevancy,
+        # strictness is how many questions it reverse-generates from the answer to
+        # compare against the original — and it is one LLM call each. The default
+        # of 3 makes this the second most expensive metric for a averaging effect
+        # that rarely changes the verdict, so it is configurable and defaults low.
+        "answer_relevancy": lambda: ResponseRelevancy(strictness=ANSWER_RELEVANCY_STRICTNESS),
         "context_precision": LLMContextPrecisionWithoutReference,
         "context_recall": LLMContextRecall,
         "factual_correctness": FactualCorrectness,
@@ -553,24 +569,42 @@ def _aggregate(rows: list[dict], metric_names: tuple[str, ...]) -> dict:
 # ── the run ──────────────────────────────────────────────────────────────────
 
 
+def select_metrics(testset: TestSet, requested: Optional[Sequence[str]]) -> tuple[str, ...]:
+    """Metrics to run: what was asked for, restricted to what the set supports.
+
+    Asking for context recall on a set with no reference answers is not an error
+    worth failing a run over — it is simply not computable, so it is dropped.
+    """
+    allowed = testset.metrics()
+    if not requested:
+        return allowed
+    chosen = tuple(m for m in allowed if m in set(requested))
+    return chosen or allowed
+
+
 def run_evaluation(
     pipeline: dict,
     config: ProviderConfig,
     testset: TestSet,
     *,
     run_id: str,
+    metrics: Optional[Sequence[str]] = None,
     cancel: Optional[threading.Event] = None,
     log: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """Answer every question in *testset*, score the answers, return the report.
 
-    Answering is sequential and cancellable between questions; scoring is a
-    single batched ragas call at the end, which is where its own concurrency
-    applies.
+    Questions are answered concurrently — they are independent and entirely
+    I/O-bound, so this is the cheapest speed-up available — then scored in a
+    single batched ragas call, which applies its own concurrency.
+
+    Scoring uses ``config.for_evaluation()``, so a workspace can chat with one
+    model and be graded by another.
     """
     say = log or (lambda _m: None)
-    metric_names = testset.metrics()
-    warning = judge_warning(config)
+    metric_names = select_metrics(testset, metrics)
+    judge = config.for_evaluation()
+    warning = judge_warning(judge)
 
     report: dict = {
         "id": run_id,
@@ -585,10 +619,11 @@ def run_evaluation(
         # Recorded per run because a score is only comparable to another score
         # produced by the same judge. Without this the trend chart would happily
         # plot a model change as a quality improvement.
-        "llm_provider": config.llm_provider,
-        "llm_model": config.resolved_llm_model,
-        "embedding_provider": config.embedding_provider,
-        "embedding_model": config.resolved_embedding_model,
+        "llm_provider": judge.llm_provider,
+        "llm_model": judge.resolved_llm_model,
+        "embedding_provider": judge.embedding_provider,
+        "embedding_model": judge.resolved_embedding_model,
+        "answered_by": f"{config.llm_provider}/{config.resolved_llm_model}",
         "judge_warning": warning,
         "scores": {},
         "rows": [],
@@ -602,18 +637,9 @@ def run_evaluation(
     if not testset.has_references:
         say("No reference answers in this set — reference-based metrics are skipped.")
 
-    rows: list[dict] = []
-    for i, item in enumerate(testset.items, start=1):
-        if cancel and cancel.is_set():
-            say("Cancelled.")
-            report["status"] = "cancelled"
-            report["rows"] = rows
-            return report
-
-        question = item["question"]
-        say(f"[{i}/{len(testset.items)}] {question[:90]}")
-        row: dict = {
-            "question": question,
+    rows: list[dict] = [
+        {
+            "question": item["question"],
             "ground_truth": item.get("ground_truth"),
             "answer": None,
             "contexts": [],
@@ -623,8 +649,16 @@ def run_evaluation(
             "scores": {},
             "error": None,
         }
+        for item in testset.items
+    ]
+
+    def answer(index: int) -> None:
+        """Fill one row in place. Runs on a worker thread."""
+        if cancel and cancel.is_set():
+            return
+        row = rows[index]
         try:
-            result = run_query(pipeline, question, web_fallback=False)
+            result = run_query(pipeline, row["question"], web_fallback=False)
             row.update(
                 answer=result.answer or "",
                 contexts=[d.page_content for d in result.context_docs],
@@ -632,21 +666,38 @@ def run_evaluation(
                 grounded=result.grounded,
                 latency_ms=result.latency_ms,
             )
-            say(f"    route={result.route} contexts={len(result.context_docs)} "
-                f"{result.latency_ms}ms")
+            say(
+                f"[{index + 1}/{len(rows)}] {row['question'][:70]} — "
+                f"route={result.route} contexts={len(result.context_docs)} "
+                f"{result.latency_ms}ms"
+            )
         except Exception as exc:
             row["error"] = str(exc)[:300]
-            say(f"    FAILED: {exc}")
-        rows.append(row)
+            say(f"[{index + 1}/{len(rows)}] FAILED: {exc}")
+
+    workers = max(1, min(EVAL_ANSWER_WORKERS, len(rows)))
+    say(f"Answering {len(rows)} question(s), {workers} at a time...")
+    if workers == 1:
+        for i in range(len(rows)):
+            if cancel and cancel.is_set():
+                break
+            answer(i)
+    else:
+        # Cancellation cannot interrupt a query already in flight, so a cancelled
+        # run finishes what is running and skips the rest — bounded by one query,
+        # not by the whole test set.
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(answer, range(len(rows))))
 
     if cancel and cancel.is_set():
+        say("Cancelled.")
         report["status"] = "cancelled"
         report["rows"] = rows
         return report
 
-    say("Scoring with RAGAS...")
+    say(f"Scoring with RAGAS ({', '.join(METRIC_LABELS[m] for m in metric_names)})...")
     try:
-        _score(rows, config, metric_names)
+        _score(rows, judge, metric_names)
     except Exception as exc:
         # The answers are still worth keeping: the per-question table, routes and
         # latencies are useful on their own, so a scoring failure degrades the
