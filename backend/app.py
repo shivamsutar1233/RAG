@@ -15,16 +15,13 @@ from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Uplo
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from langchain_core.documents import Document as LangDocument
-from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel
-from ddgs import DDGS
 
 # Import pipeline components from main.py
 from .auth import AUTH_ENABLED, CurrentUser, auth_status, get_current_user
-from .main import post_filter_documents, setup_pipeline
-from .multi_rep_utils import restore_original_content
+from .main import setup_pipeline
 from .providers import ConfigError, provider_catalog
+from .query_run import collect_sources, run_query, web_search
 from .storage import get_storage_client
 from .user_config import embedding_changed, load_user_config, save_user_config
 from .workspace import InvalidUserIdError, Workspace
@@ -69,66 +66,6 @@ MAX_RESIDENT_PIPELINES = int(os.getenv("MAX_RESIDENT_PIPELINES", "4"))
 # Ingestion makes one model call per chunk. On CPU-bound local models that is slow,
 # so the ceiling is generous — it exists to stop a wedged run holding the lock forever.
 INGEST_TIMEOUT_SECONDS = int(os.getenv("INGEST_TIMEOUT_SECONDS", "3600"))
-
-# Below this cross-encoder score the retrieved chunks are not about the question at
-# all. Measured against a coffee-handbook index: "what is the capital of France?"
-# scored 0.0013, while genuine hits scored 0.79-0.99.
-#
-# The floor is deliberately low. Cross-encoders are unreliable in the *other*
-# direction — "explain quantum entanglement" scored 0.988 against an unrelated
-# chunk — so a high score proves nothing and only a very low one is trustworthy.
-# Catching the obvious misses is all this is for; the prompt handles the rest by
-# letting the model read the context and judge for itself.
-RELEVANCE_FLOOR = float(os.getenv("RELEVANCE_FLOOR", "0.02"))
-
-
-def _context_is_relevant(docs: list) -> bool:
-    """True when retrieval produced context plausibly about the question."""
-    if not docs:
-        return False
-    scores = [
-        doc.metadata.get("relevance_score")
-        for doc in docs
-        if doc.metadata.get("relevance_score") is not None
-    ]
-    if not scores:
-        # No reranker score available (the fast path skips reranking), so we cannot
-        # judge — assume grounded rather than mislabel a good answer.
-        return True
-    return max(float(s) for s in scores) >= RELEVANCE_FLOOR
-
-
-def _web_search(query: str, max_results: int = 5) -> list[dict]:
-    """Run a DuckDuckGo text search and return the top results.
-
-    Returns an empty list on any failure so callers can treat it as
-    an optional enrichment rather than a critical path dependency.
-    """
-    try:
-        with DDGS() as ddgs:
-            return list(ddgs.text(query, max_results=max_results))
-    except Exception as exc:
-        print(f"[DDG] Search failed: {exc}", file=sys.stderr)
-        return []
-
-
-def _ddg_results_to_docs(results: list[dict]) -> list:
-    """Convert DuckDuckGo result dicts to LangChain Document objects."""
-    return [
-        LangDocument(
-            page_content=r.get("body", ""),
-            metadata={
-                "source": r.get("href", ""),
-                "title": r.get("title", "Web Result"),
-                "data_source": "web_search",
-                # Use a mid-range score so _context_is_relevant passes, but we
-                # still mark grounded=False via the web_sources sentinel.
-                "relevance_score": 0.5,
-            },
-        )
-        for r in results
-    ]
-
 
 class PipelineCache:
     """LRU of per-workspace pipelines, plus a per-workspace ingest lock.
@@ -499,176 +436,15 @@ def chat_endpoint(
     pipeline = require_pipeline(workspace, token=user.token)
 
     try:
-        query = request.message.strip()
-
-        # 1. Convert JSON chat history to LangChain messages
-        chat_history = []
-        for msg in request.history:
-            if msg.role == "user":
-                chat_history.append(HumanMessage(content=msg.content))
-            elif msg.role == "assistant":
-                chat_history.append(AIMessage(content=msg.content))
-
-        # 2. Contextualize query if history exists
-        llm = pipeline["llm"]
-        if chat_history:
-            contextualize_chain = pipeline["contextualize_q_prompt"] | llm
-            standalone_q = contextualize_chain.invoke(
-                {"input": query, "chat_history": chat_history}
-            ).text.strip()
-        else:
-            standalone_q = query
-
-        # 3. Check Semantic Router
-        routing_retriever = pipeline["routing_retriever"]
-        route, _ = routing_retriever.determine_route(standalone_q)
-
-        sources_list: list[SourceDocument] = []
-        # Populated only when a DuckDuckGo fallback is used in the else-branch below.
-        web_sources: list[SourceDocument] = []
-
-        if route == "simple":
-            # Fast Path Bypass
-            fast_result = pipeline["fast_rag_chain"].invoke(
-                {"input": standalone_q, "chat_history": chat_history}
-            )
-            answer = fast_result["answer"]
-            context_docs = fast_result.get("context", [])
-        else:
-            # Heavy pipeline
-            query_analyzer = pipeline["query_analyzer"]
-            structured_query = query_analyzer.analyze(standalone_q)
-
-            # Build DB filters
-            db_filters = {}
-            if structured_query.file_type:
-                db_filters["file_type"] = structured_query.file_type
-            if structured_query.publish_year:
-                db_filters["year"] = structured_query.publish_year
-            if structured_query.page_number:
-                db_filters["page"] = structured_query.page_number
-            if structured_query.data_source:
-                db_filters["data_source"] = structured_query.data_source
-
-            pipeline["vector_retriever"].search_kwargs["filter"] = (
-                db_filters if db_filters else None
-            )
-
-            if route == "decomposition":
-                from .decomposition_graph import create_decomposition_graph
-
-                graph = create_decomposition_graph(pipeline["compression_retriever"], llm)
-                state = graph.invoke(
-                    {
-                        "main_question": structured_query.content_search,
-                        "sub_questions": [],
-                        "current_index": 0,
-                        "sub_answers": [],
-                        "retrieved_docs": [],
-                        "final_answer": "",
-                    }
-                )
-                answer = state["final_answer"]
-                context_docs = restore_original_content(state["retrieved_docs"])
-
-            elif route == "standard" and any(
-                kw in structured_query.content_search.lower()
-                for kw in (
-                    "compare",
-                    "versus",
-                    "difference",
-                    "evaluate",
-                    "analyse",
-                    "analyze",
-                    "pros and cons",
-                    "tradeoff",
-                    "contrast",
-                )
-            ):
-                from .agentic_graph import create_agentic_graph
-
-                agentic = create_agentic_graph(pipeline["compression_retriever"], llm)
-                agentic_state = agentic.invoke(
-                    {
-                        "question": structured_query.content_search,
-                        "rewritten_question": "",
-                        "retrieved_docs": [],
-                        "relevant_docs": [],
-                        "answer": "",
-                        "reflection_passed": False,
-                        "answer_relevant": False,
-                        "retry_count": 0,
-                    }
-                )
-                answer = agentic_state["answer"]
-                context_docs = restore_original_content(
-                    agentic_state["relevant_docs"] or agentic_state["retrieved_docs"]
-                )
-            else:
-                # Retrieve documents
-                context_docs = routing_retriever.retrieve_for_route(
-                    structured_query.content_search, route
-                )
-                context_docs = post_filter_documents(context_docs, structured_query)
-                context_docs = restore_original_content(context_docs)
-
-                # DuckDuckGo auto-fallback: when retrieval finds nothing relevant
-                # in the user's documents, search the web before giving up.
-                if not _context_is_relevant(context_docs):
-                    ddg_results = _web_search(request.message)
-                    if ddg_results:
-                        context_docs = _ddg_results_to_docs(ddg_results)
-                        web_sources = [
-                            SourceDocument(
-                                title=r.get("title", "Web Result"),
-                                source=r.get("href", ""),
-                                page=None,
-                                snippet=r.get("body", "")[:250].strip(),
-                            )
-                            for r in ddg_results
-                        ]
-                        print(
-                            f"[DDG] Falling back to web search for query: '{request.message[:60]}'",
-                            file=sys.stderr,
-                        )
-
-                answer = pipeline["question_answer_chain"].invoke(
-                    {
-                        "context": context_docs,
-                        "input": structured_query.content_search,
-                        "chat_history": chat_history,
-                    }
-                )
-
-        # An answer is grounded in the user's documents only when the reranked
-        # context cleared the relevance floor AND we did not use a DDG fallback.
-        # Web-search answers keep grounded=False so the UI can badge them.
-        grounded = _context_is_relevant(context_docs) and not web_sources
-
-        # Build source citations
-        seen_keys: set = set()
-        if grounded:
-            for doc in context_docs:
-                source_url = doc.metadata.get("source", "Unknown Source")
-                title = doc.metadata.get("title", os.path.basename(source_url))
-                page = doc.metadata.get("page")
-                snippet = doc.page_content[:250].strip()
-                key = (title, page, snippet[:50])
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    sources_list.append(
-                        SourceDocument(title=title, source=source_url, page=page, snippet=snippet)
-                    )
-        # Always surface web sources when a DDG fallback was used.
-        sources_list.extend(web_sources)
+        result = run_query(pipeline, request.message, request.history)
+        sources = collect_sources(result.context_docs, result.web_results, result.grounded)
 
         return ChatResponse(
-            answer=answer,
-            route=route,
-            sources=sources_list[:5],
-            grounded=grounded,
+            answer=result.answer or "",
+            route=result.route,
+            sources=[SourceDocument(**s) for s in sources[:5]],
+            grounded=result.grounded,
         )
-
     except Exception as e:
         print(f"[API ERROR] Chat execution failed: {e}", file=sys.stderr)
         import traceback
@@ -686,121 +462,6 @@ def chat_endpoint(
 # ─────────────────────────────────────────────────────────────────────────────
 # Streaming chat  (Server-Sent Events)
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _retrieve_for_streaming(request: ChatRequest, pipeline: dict) -> dict:
-    """Run the full retrieval pipeline synchronously.
-
-    Designed to be called from ``run_in_executor`` so the event loop is never
-    blocked.  Returns a dict that the streaming endpoint uses to either stream
-    the final LLM generation or yield a pre-computed answer from a graph route.
-    """
-    query = request.message.strip()
-
-    chat_history: list = []
-    for msg in request.history:
-        if msg.role == "user":
-            chat_history.append(HumanMessage(content=msg.content))
-        elif msg.role == "assistant":
-            chat_history.append(AIMessage(content=msg.content))
-
-    llm = pipeline["llm"]
-    if chat_history:
-        contextualize_chain = pipeline["contextualize_q_prompt"] | llm
-        standalone_q = contextualize_chain.invoke(
-            {"input": query, "chat_history": chat_history}
-        ).text.strip()
-    else:
-        standalone_q = query
-
-    routing_retriever = pipeline["routing_retriever"]
-    route, _ = routing_retriever.determine_route(standalone_q)
-
-    if route == "simple":
-        fast_result = pipeline["fast_rag_chain"].invoke(
-            {"input": standalone_q, "chat_history": chat_history}
-        )
-        return {
-            "route": route,
-            "context_docs": fast_result.get("context", []),
-            "chat_history": chat_history,
-            "query_text": standalone_q,
-            "full_answer": fast_result["answer"],
-            "streamable": False,
-        }
-
-    query_analyzer = pipeline["query_analyzer"]
-    structured_query = query_analyzer.analyze(standalone_q)
-
-    db_filters: dict = {}
-    if structured_query.file_type:
-        db_filters["file_type"] = structured_query.file_type
-    if structured_query.publish_year:
-        db_filters["year"] = structured_query.publish_year
-    if structured_query.page_number:
-        db_filters["page"] = structured_query.page_number
-    if structured_query.data_source:
-        db_filters["data_source"] = structured_query.data_source
-    pipeline["vector_retriever"].search_kwargs["filter"] = db_filters if db_filters else None
-
-    if route == "decomposition":
-        from .decomposition_graph import create_decomposition_graph
-
-        graph = create_decomposition_graph(pipeline["compression_retriever"], llm)
-        state = graph.invoke({
-            "main_question": structured_query.content_search,
-            "sub_questions": [], "current_index": 0,
-            "sub_answers": [], "retrieved_docs": [], "final_answer": "",
-        })
-        return {
-            "route": route,
-            "context_docs": restore_original_content(state["retrieved_docs"]),
-            "chat_history": chat_history,
-            "query_text": structured_query.content_search,
-            "full_answer": state["final_answer"],
-            "streamable": False,
-        }
-
-    if route == "standard" and any(
-        kw in structured_query.content_search.lower()
-        for kw in (
-            "compare", "versus", "difference", "evaluate", "analyse", "analyze",
-            "pros and cons", "tradeoff", "contrast",
-        )
-    ):
-        from .agentic_graph import create_agentic_graph
-
-        agentic = create_agentic_graph(pipeline["compression_retriever"], llm)
-        agentic_state = agentic.invoke({
-            "question": structured_query.content_search,
-            "rewritten_question": "", "retrieved_docs": [],
-            "relevant_docs": [], "answer": "",
-            "reflection_passed": False, "answer_relevant": False, "retry_count": 0,
-        })
-        return {
-            "route": route,
-            "context_docs": restore_original_content(
-                agentic_state["relevant_docs"] or agentic_state["retrieved_docs"]
-            ),
-            "chat_history": chat_history,
-            "query_text": structured_query.content_search,
-            "full_answer": agentic_state["answer"],
-            "streamable": False,
-        }
-
-    # standard / multi_query / rag_fusion / step_back / hyde ─ streamable
-    context_docs = routing_retriever.retrieve_for_route(
-        structured_query.content_search, route
-    )
-    context_docs = post_filter_documents(context_docs, structured_query)
-    context_docs = restore_original_content(context_docs)
-    return {
-        "route": route,
-        "context_docs": context_docs,
-        "chat_history": chat_history,
-        "query_text": structured_query.content_search,
-        "full_answer": None,
-        "streamable": True,
-    }
 
 
 @app.post("/api/chat/stream")
@@ -829,53 +490,22 @@ async def chat_stream_endpoint(
         loop = asyncio.get_running_loop()
 
         # ── Phase 1: Retrieval (sync, runs on thread pool) ────────────────
+        # run_query performs the DuckDuckGo fallback internally, so that too
+        # stays off the event loop instead of needing its own executor hop.
         try:
-            retrieval = await loop.run_in_executor(
-                None, lambda: _retrieve_for_streaming(request, pipeline)
+            result = await loop.run_in_executor(
+                None,
+                lambda: run_query(pipeline, request.message, request.history, stream=True),
             )
         except Exception as exc:
             print(f"[STREAM] Retrieval failed: {exc}", file=sys.stderr)
             yield f"data: {json.dumps({'error': 'An internal server error occurred while processing your request. Please check server logs.', 'done': True})}\n\n"
             return
 
-        route: str = retrieval["route"]
-        context_docs: list = retrieval["context_docs"]
-        chat_history: list = retrieval["chat_history"]
-        query_text: str = retrieval["query_text"]
-        streamable: bool = retrieval["streamable"]
-        pre_answer: str | None = retrieval.get("full_answer")
-
-        # ── Phase 2: DuckDuckGo fallback (streamable routes only) ─────────
-        web_sources_stream: list[SourceDocument] = []
-        if streamable and not _context_is_relevant(context_docs):
-            try:
-                ddg_results = await loop.run_in_executor(
-                    None, lambda: _web_search(request.message)
-                )
-                if ddg_results:
-                    context_docs = _ddg_results_to_docs(ddg_results)
-                    web_sources_stream = [
-                        SourceDocument(
-                            title=r.get("title", "Web Result"),
-                            source=r.get("href", ""),
-                            page=None,
-                            snippet=r.get("body", "")[:250].strip(),
-                        )
-                        for r in ddg_results
-                    ]
-                    print(
-                        f"[DDG/STREAM] Web fallback for: '{request.message[:60]}'",
-                        file=sys.stderr,
-                    )
-            except Exception as exc:
-                print(f"[DDG/STREAM] Search failed: {exc}", file=sys.stderr)
-
-        grounded = _context_is_relevant(context_docs) and not web_sources_stream
-
-        # ── Phase 3: Token streaming ───────────────────────────────────────
-        if not streamable:
+        # ── Phase 2: Token streaming ───────────────────────────────────────
+        if not result.streamable:
             # Graph routes already have the answer — yield it as one block.
-            yield f"data: {json.dumps({'token': pre_answer or '', 'done': False})}\n\n"
+            yield f"data: {json.dumps({'token': result.answer or '', 'done': False})}\n\n"
         else:
             question_answer_chain = pipeline["question_answer_chain"]
             token_q: asyncio.Queue = asyncio.Queue()
@@ -883,9 +513,9 @@ async def chat_stream_endpoint(
             def _streamer() -> None:
                 try:
                     for chunk in question_answer_chain.stream({
-                        "context": context_docs,
-                        "input": query_text,
-                        "chat_history": chat_history,
+                        "context": result.context_docs,
+                        "input": result.query_text,
+                        "chat_history": result.chat_history,
                     }):
                         asyncio.run_coroutine_threadsafe(token_q.put(chunk), loop)
                 except Exception as exc:  # noqa: BLE001
@@ -904,28 +534,14 @@ async def chat_stream_endpoint(
                     return
                 yield f"data: {json.dumps({'token': item, 'done': False})}\n\n"
 
-        # ── Phase 4: Final metadata event ─────────────────────────────────
-        sources_out: list[SourceDocument] = []
-        seen_keys: set = set()
-        if grounded:
-            for doc in context_docs:
-                source_url = doc.metadata.get("source", "Unknown Source")
-                title = doc.metadata.get("title", os.path.basename(source_url))
-                page = doc.metadata.get("page")
-                snippet = doc.page_content[:250].strip()
-                key = (title, page, snippet[:50])
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    sources_out.append(
-                        SourceDocument(title=title, source=source_url, page=page, snippet=snippet)
-                    )
-        sources_out.extend(web_sources_stream)
-
+        # ── Phase 3: Final metadata event ─────────────────────────────────
         final_event = json.dumps({
             "done": True,
-            "route": route,
-            "sources": [s.model_dump() for s in sources_out[:5]],
-            "grounded": grounded,
+            "route": result.route,
+            "sources": collect_sources(
+                result.context_docs, result.web_results, result.grounded
+            )[:5],
+            "grounded": result.grounded,
         })
         yield f"data: {final_event}\n\n"
 
@@ -944,7 +560,7 @@ def web_search_endpoint(
     """DuckDuckGo search proxy — returns up to 8 results for the given query."""
     if not q or not q.strip():
         raise HTTPException(status_code=400, detail="Query parameter 'q' is required.")
-    results = _web_search(q.strip(), max_results=8)
+    results = web_search(q.strip(), max_results=8)
     return {"results": results}
 
 
