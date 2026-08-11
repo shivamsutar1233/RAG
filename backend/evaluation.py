@@ -33,6 +33,7 @@ import re
 import statistics
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -84,6 +85,14 @@ REFERENCE_FREE_METRICS = ("faithfulness", "answer_relevancy", "context_precision
 REFERENCE_ONLY_METRICS = ("context_recall", "factual_correctness")
 ALL_METRICS = REFERENCE_FREE_METRICS + REFERENCE_ONLY_METRICS
 
+# Metrics that grade the answer against its retrieved context. When retrieval
+# came back empty there is nothing for them to grade, and asking anyway is the
+# worst case for cost: an ungrounded answer is long, faithfulness splits it into
+# many statements, and every one is an LLM call to verify against nothing.
+CONTEXT_DEPENDENT_METRICS = frozenset(
+    {"faithfulness", "context_precision", "context_recall"}
+)
+
 METRIC_LABELS: dict[str, str] = {
     "faithfulness": "Faithfulness",
     "answer_relevancy": "Answer relevancy",
@@ -117,6 +126,15 @@ EVAL_ANSWER_WORKERS = int(os.getenv("EVAL_ANSWER_WORKERS", str(EVAL_MAX_WORKERS)
 # call each. RAGAS defaults to 3; 1 is usually indistinguishable in the aggregate
 # and cuts a third of that metric's cost.
 ANSWER_RELEVANCY_STRICTNESS = int(os.getenv("ANSWER_RELEVANCY_STRICTNESS", "1"))
+
+# Rows per ragas call. Scoring everything in one call emits no progress until it
+# finishes and cannot be interrupted, which is indistinguishable from a hang.
+EVAL_SCORE_BATCH = max(1, int(os.getenv("EVAL_SCORE_BATCH", "5")))
+
+# Wall-clock ceiling for a whole run. Without one, a slow judge leaves a run in
+# "running" forever: the dashboard spins and the one-run-at-a-time guard locks
+# the workspace out of starting another. Hitting it keeps whatever was scored.
+EVAL_RUN_TIMEOUT_SECONDS = int(os.getenv("EVAL_RUN_TIMEOUT_SECONDS", "3600"))
 
 # Ollama's default is a 1B model. It cannot reliably produce the structured
 # judgements RAGAS asks for, and silently returns near-random scores rather than
@@ -470,22 +488,18 @@ def _build_metrics(names: tuple[str, ...]) -> tuple[list[Any], dict[str, str]]:
     return metrics, aliases
 
 
-def _score(rows: list[dict], config: ProviderConfig, metric_names: tuple[str, ...]) -> None:
-    """Attach per-row scores to *rows* in place.
+def _score_batch(
+    batch: list[dict], config: ProviderConfig, metric_names: tuple[str, ...]
+) -> None:
+    """Score one batch of rows in place with *metric_names*."""
+    if not batch or not metric_names:
+        return
 
-    Rows the pipeline failed on are excluded from scoring — asking a judge to
-    grade an error message wastes calls and drags the average down for a reason
-    that has nothing to do with retrieval quality.
-    """
     _install_vertexai_shim()
 
     from ragas import EvaluationDataset, RunConfig, SingleTurnSample, evaluate
     from ragas.embeddings import LangchainEmbeddingsWrapper
     from ragas.llms import LangchainLLMWrapper
-
-    scorable = [r for r in rows if not r.get("error") and r.get("answer")]
-    if not scorable:
-        return
 
     samples = [
         SingleTurnSample(
@@ -494,7 +508,7 @@ def _score(rows: list[dict], config: ProviderConfig, metric_names: tuple[str, ..
             response=r["answer"],
             reference=r.get("ground_truth"),
         )
-        for r in scorable
+        for r in batch
     ]
 
     metrics, aliases = _build_metrics(metric_names)
@@ -512,8 +526,71 @@ def _score(rows: list[dict], config: ProviderConfig, metric_names: tuple[str, ..
         show_progress=False,
     )
 
-    for row, scores in zip(scorable, _per_row_scores(result, len(scorable), aliases)):
-        row["scores"] = scores
+    for row, scores in zip(batch, _per_row_scores(result, len(batch), aliases)):
+        row["scores"].update(scores)
+
+
+def _score(
+    rows: list[dict],
+    config: ProviderConfig,
+    metric_names: tuple[str, ...],
+    *,
+    cancel: Optional[threading.Event] = None,
+    deadline: Optional[float] = None,
+    log: Optional[Callable[[str], None]] = None,
+) -> None:
+    """Attach per-row scores to *rows* in place.
+
+    Scored in batches rather than one giant ragas call. A single call is opaque:
+    it emits nothing until every row is done, cannot be cancelled, and cannot be
+    stopped when a run has overrun its budget — which is exactly how a run ends up
+    apparently stuck with a silent log. Batching gives progress, a cancellation
+    point, and a deadline check between batches.
+
+    Rows the pipeline failed on are skipped: asking a judge to grade an error
+    message wastes calls and drags the average down for a reason that has nothing
+    to do with retrieval quality. Rows that retrieved *nothing* are skipped for
+    the context-relative metrics only — there is no context to grade them
+    against, and an ungrounded answer is the most expensive thing to ask about.
+    """
+    say = log or (lambda _m: None)
+    scorable = [r for r in rows if not r.get("error") and r.get("answer")]
+    if not scorable:
+        say("Nothing to score — every question failed.")
+        return
+
+    with_context = [r for r in scorable if r.get("contexts")]
+    without_context = [r for r in scorable if not r.get("contexts")]
+    context_free = tuple(m for m in metric_names if m not in CONTEXT_DEPENDENT_METRICS)
+
+    if without_context:
+        skipped = ", ".join(m for m in metric_names if m in CONTEXT_DEPENDENT_METRICS)
+        say(
+            f"{len(without_context)} question(s) retrieved no context — "
+            f"skipping {skipped or 'context metrics'} for those."
+        )
+
+    groups = [(with_context, metric_names), (without_context, context_free)]
+    total = sum(len(g) for g, m in groups if m)
+    done = 0
+
+    for group, metrics in groups:
+        if not metrics:
+            continue
+        for start in range(0, len(group), EVAL_SCORE_BATCH):
+            if cancel and cancel.is_set():
+                say("Cancelled during scoring — partial scores kept.")
+                return
+            if deadline is not None and time.monotonic() >= deadline:
+                say(
+                    f"Scoring budget exhausted after {done}/{total} question(s). "
+                    f"Raise EVAL_RUN_TIMEOUT_SECONDS to score the rest."
+                )
+                return
+            batch = group[start : start + EVAL_SCORE_BATCH]
+            _score_batch(batch, config, metrics)
+            done += len(batch)
+            say(f"  scored {done}/{total}")
 
 
 def _per_row_scores(result: Any, expected: int, aliases: dict[str, str]) -> list[dict]:
@@ -605,6 +682,7 @@ def run_evaluation(
     metric_names = select_metrics(testset, metrics)
     judge = config.for_evaluation()
     warning = judge_warning(judge)
+    deadline = time.monotonic() + EVAL_RUN_TIMEOUT_SECONDS
 
     report: dict = {
         "id": run_id,
@@ -695,9 +773,22 @@ def run_evaluation(
         report["rows"] = rows
         return report
 
+    if time.monotonic() >= deadline:
+        # Answering alone blew the budget. Return what we have rather than
+        # starting a scoring phase that cannot finish either.
+        say("Run budget exhausted while answering — returning unscored answers.")
+        report["rows"] = rows
+        report["scores"] = _aggregate(rows, metric_names)
+        report["status"] = "completed"
+        report["error"] = (
+            "Timed out before scoring. Answers were kept. Use a faster judge, "
+            "fewer questions, or raise EVAL_RUN_TIMEOUT_SECONDS."
+        )
+        return report
+
     say(f"Scoring with RAGAS ({', '.join(METRIC_LABELS[m] for m in metric_names)})...")
     try:
-        _score(rows, judge, metric_names)
+        _score(rows, judge, metric_names, cancel=cancel, deadline=deadline, log=say)
     except Exception as exc:
         # The answers are still worth keeping: the per-question table, routes and
         # latencies are useful on their own, so a scoring failure degrades the

@@ -966,6 +966,37 @@ async def stream_build_logs(build_id: str, user: CurrentUser = Depends(get_curre
 
 ACTIVE_EVALS: Dict[str, threading.Event] = {}
 
+# Runs live in this process, so a restart abandons any that were in flight. Their
+# status JSON still says "running", which would spin the dashboard forever and —
+# worse — trip the one-run-at-a-time guard, locking the workspace out of ever
+# starting another. Anything that claims to be running but began before this
+# process did is therefore a ghost, and gets reaped on sight.
+PROCESS_STARTED_AT = datetime.now(timezone.utc)
+
+
+def _reap_ghost_runs(evals_dir: Path) -> None:
+    """Mark runs abandoned by a restart as failed. Cheap and idempotent."""
+    if not evals_dir.is_dir():
+        return
+    for path in evals_dir.glob("*.json"):
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if meta.get("status") != "running" or meta.get("id") in ACTIVE_EVALS:
+            continue
+        try:
+            started = datetime.fromisoformat(meta["started_at"])
+        except (KeyError, TypeError, ValueError):
+            started = PROCESS_STARTED_AT  # unparseable: treat as a ghost
+        if started >= PROCESS_STARTED_AT:
+            continue  # started by this process and still tracked elsewhere
+        meta["status"] = "failed"
+        meta["completed_at"] = datetime.now(timezone.utc).isoformat()
+        meta["error"] = "Interrupted by a server restart."
+        _write_run_json(path, meta)
+        print(f"[API] Reaped abandoned evaluation run {meta.get('id')}.", file=sys.stderr)
+
 
 def _write_run_json(path: Path, data: dict) -> None:
     """Write run metadata atomically.
@@ -983,6 +1014,7 @@ def _running_run(evals_dir: Path) -> Optional[str]:
     """Id of the run currently in progress for this workspace, if any."""
     if not evals_dir.is_dir():
         return None
+    _reap_ghost_runs(evals_dir)
     for path in evals_dir.glob("*.json"):
         try:
             meta = json.loads(path.read_text(encoding="utf-8"))
@@ -1242,6 +1274,7 @@ def list_eval_runs(user: CurrentUser = Depends(get_current_user)):
     chunk, which would make this response enormous."""
     workspace = current_workspace(user)
     workspace.sync_evals_from_storage(user.token)
+    _reap_ghost_runs(workspace.evals_dir)
 
     runs = []
     if workspace.evals_dir.is_dir():

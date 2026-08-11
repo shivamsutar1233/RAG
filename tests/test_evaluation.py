@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -413,3 +414,101 @@ def test_run_records_both_the_answering_model_and_the_judge(monkeypatch):
     assert report["llm_model"] == "claude-opus-5"          # who judged
     assert report["answered_by"] == "ollama/llama3.2:1b"   # who answered
     assert report["judge_warning"] is None
+
+
+# ── stuck / interrupted runs ─────────────────────────────────────────────────
+
+
+def test_rows_without_context_skip_the_context_metrics(monkeypatch):
+    """The expensive-and-meaningless case: retrieval returned nothing, so the
+    answer is ungrounded and long, and faithfulness would split it into many
+    statements to verify against no context at all."""
+    import backend.evaluation as ev
+
+    seen: list[tuple[int, tuple]] = []
+
+    def fake_batch(batch, _config, metric_names):
+        seen.append((len(batch), tuple(metric_names)))
+
+    monkeypatch.setattr(ev, "_score_batch", fake_batch)
+    rows = [
+        {"question": "a", "answer": "x", "contexts": ["c"], "scores": {}, "error": None},
+        {"question": "b", "answer": "y", "contexts": [], "scores": {}, "error": None},
+    ]
+    ev._score(rows, ProviderConfig(), ALL_METRICS)
+
+    by_metrics = {metrics: n for n, metrics in seen}
+    assert by_metrics[ALL_METRICS] == 1  # the row that had context
+    # the contextless row is graded only on what does not need context
+    assert by_metrics[("answer_relevancy", "factual_correctness")] == 1
+
+
+def test_scoring_stops_at_the_deadline_and_keeps_what_it_had(monkeypatch):
+    """Without this a slow judge leaves the run 'running' forever, which also
+    trips the one-run-at-a-time guard and locks the workspace."""
+    import backend.evaluation as ev
+
+    calls = []
+    monkeypatch.setattr(
+        ev, "_score_batch", lambda b, c, m: calls.append(len(b))
+    )
+    monkeypatch.setattr(ev, "EVAL_SCORE_BATCH", 1)
+
+    rows = [
+        {"question": str(i), "answer": "x", "contexts": ["c"], "scores": {}, "error": None}
+        for i in range(5)
+    ]
+    logged: list[str] = []
+    ev._score(
+        rows,
+        ProviderConfig(),
+        ("faithfulness",),
+        deadline=time.monotonic() - 1,  # already expired
+        log=logged.append,
+    )
+    assert calls == []
+    assert any("budget exhausted" in m for m in logged)
+
+
+def test_scoring_can_be_cancelled_between_batches(monkeypatch):
+    import backend.evaluation as ev
+
+    calls = []
+    cancel = threading.Event()
+
+    def fake_batch(batch, _c, _m):
+        calls.append(len(batch))
+        cancel.set()  # cancel arrives while the first batch is in flight
+
+    monkeypatch.setattr(ev, "_score_batch", fake_batch)
+    monkeypatch.setattr(ev, "EVAL_SCORE_BATCH", 1)
+    rows = [
+        {"question": str(i), "answer": "x", "contexts": ["c"], "scores": {}, "error": None}
+        for i in range(4)
+    ]
+    ev._score(rows, ProviderConfig(), ("faithfulness",), cancel=cancel, log=lambda _m: None)
+    assert calls == [1]  # stopped after the first batch instead of grinding on
+
+
+def test_run_that_overruns_while_answering_returns_unscored_answers(monkeypatch):
+    import backend.evaluation as ev
+
+    monkeypatch.setattr(ev, "EVAL_RUN_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(ev, "EVAL_ANSWER_WORKERS", 1)
+    scored = []
+    monkeypatch.setattr(ev, "_score", lambda *a, **k: scored.append(1))
+    monkeypatch.setattr(
+        ev,
+        "run_query",
+        lambda *a, **k: SimpleNamespace(
+            answer="a", context_docs=[], route="simple", grounded=True, latency_ms=1
+        ),
+    )
+
+    ts = EvalTestSet(name="t", items=[{"question": "q"}])
+    report = ev.run_evaluation(pipeline={}, config=ProviderConfig(), testset=ts, run_id="r")
+
+    assert report["status"] == "completed"        # not left "running"
+    assert scored == []                            # never started scoring
+    assert "Timed out before scoring" in report["error"]
+    assert report["rows"][0]["answer"] == "a"      # the work done is kept
