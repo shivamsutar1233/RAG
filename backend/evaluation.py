@@ -414,7 +414,18 @@ def generate_testset(
 # ── scoring ──────────────────────────────────────────────────────────────────
 
 
-def _build_metrics(names: tuple[str, ...]) -> list[Any]:
+def _build_metrics(names: tuple[str, ...]) -> tuple[list[Any], dict[str, str]]:
+    """Instantiate the requested metrics, plus a map from RAGAS's own metric
+    name back to our report key.
+
+    The two are not always the same — ``LLMContextPrecisionWithoutReference``
+    reports itself as ``llm_context_precision_without_reference``. Deriving the
+    map from the constructed objects rather than hardcoding it means a rename in
+    a future ragas release cannot silently blank a column: the key is whatever
+    the object says it is.
+    """
+    _install_vertexai_shim()
+
     from ragas.metrics import (
         FactualCorrectness,
         Faithfulness,
@@ -430,7 +441,17 @@ def _build_metrics(names: tuple[str, ...]) -> list[Any]:
         "context_recall": LLMContextRecall,
         "factual_correctness": FactualCorrectness,
     }
-    return [builders[n]() for n in names if n in builders]
+    metrics: list[Any] = []
+    aliases: dict[str, str] = {}
+    for name in names:
+        builder = builders.get(name)
+        if builder is None:
+            continue
+        metric = builder()
+        metrics.append(metric)
+        aliases[getattr(metric, "name", name)] = name
+        aliases[name] = name
+    return metrics, aliases
 
 
 def _score(rows: list[dict], config: ProviderConfig, metric_names: tuple[str, ...]) -> None:
@@ -460,9 +481,10 @@ def _score(rows: list[dict], config: ProviderConfig, metric_names: tuple[str, ..
         for r in scorable
     ]
 
+    metrics, aliases = _build_metrics(metric_names)
     result = evaluate(
         dataset=EvaluationDataset(samples=samples),
-        metrics=_build_metrics(metric_names),
+        metrics=metrics,
         llm=LangchainLLMWrapper(get_llm(config)),
         embeddings=LangchainEmbeddingsWrapper(get_embeddings(config)),
         run_config=RunConfig(
@@ -474,11 +496,11 @@ def _score(rows: list[dict], config: ProviderConfig, metric_names: tuple[str, ..
         show_progress=False,
     )
 
-    for row, scores in zip(scorable, _per_row_scores(result, len(scorable))):
+    for row, scores in zip(scorable, _per_row_scores(result, len(scorable), aliases)):
         row["scores"] = scores
 
 
-def _per_row_scores(result: Any, expected: int) -> list[dict]:
+def _per_row_scores(result: Any, expected: int, aliases: dict[str, str]) -> list[dict]:
     """Per-row scores from a ragas EvaluationResult, as plain JSON-safe dicts.
 
     ``EvaluationResult.scores`` is the documented per-sample list, but the shape
@@ -499,11 +521,15 @@ def _per_row_scores(result: Any, expected: int) -> list[dict]:
     out: list[dict] = []
     for i in range(expected):
         entry = rows[i] if i < len(rows) else {}
-        out.append({
-            k: round(float(v), 4)
-            for k, v in entry.items()
-            if k in METRIC_LABELS and isinstance(v, (int, float)) and not _is_nan(v)
-        })
+        scores: dict = {}
+        for key, value in entry.items():
+            report_key = aliases.get(key)
+            if report_key is None or not isinstance(value, (int, float)):
+                continue
+            if isinstance(value, bool) or _is_nan(value):
+                continue
+            scores[report_key] = round(float(value), 4)
+        out.append(scores)
     return out
 
 

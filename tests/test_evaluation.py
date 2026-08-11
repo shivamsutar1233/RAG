@@ -18,8 +18,10 @@ from backend.evaluation import (  # noqa: E402
     METRIC_LABELS,
     REFERENCE_FREE_METRICS,
     _aggregate,
+    _build_metrics,
     _clean_line,
     _clean_question,
+    _per_row_scores,
     judge_warning,
     parse_testset,
 )
@@ -153,6 +155,28 @@ def test_aggregate_reports_none_when_nothing_scored():
 
 def test_every_metric_has_a_label():
     assert set(ALL_METRICS) <= set(METRIC_LABELS)
+
+
+def test_ragas_metric_names_map_back_to_report_keys():
+    """RAGAS does not name every metric the way we do — context precision
+    reports itself as `llm_context_precision_without_reference`. If the alias map
+    misses one, that column silently reads '—' forever instead of failing."""
+    metrics, aliases = _build_metrics(ALL_METRICS)
+    assert len(metrics) == len(ALL_METRICS)
+    for metric, key in zip(metrics, ALL_METRICS):
+        assert aliases[metric.name] == key
+
+
+def test_per_row_scores_translates_ragas_names():
+    _metrics, aliases = _build_metrics(ALL_METRICS)
+    raw = type("R", (), {"scores": [{"llm_context_precision_without_reference": 0.5}]})()
+    assert _per_row_scores(raw, 1, aliases) == [{"context_precision": 0.5}]
+
+
+def test_per_row_scores_drops_nan_and_pads_missing_rows():
+    aliases = {"faithfulness": "faithfulness"}
+    raw = type("R", (), {"scores": [{"faithfulness": float("nan")}]})()
+    assert _per_row_scores(raw, 2, aliases) == [{}, {}]
 
 
 # ── generation output cleaning ───────────────────────────────────────────────
