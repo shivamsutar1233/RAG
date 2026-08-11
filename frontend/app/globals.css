@@ -80,11 +80,23 @@
   --border: oklch(0.912 0.009 162);
   --input: oklch(0.912 0.009 162);
   --ring: oklch(0.36 0.075 162);
-  --chart-1: oklch(0.36 0.075 162);
-  --chart-2: oklch(0.52 0.09 190);
-  --chart-3: oklch(0.62 0.11 128);
-  --chart-4: oklch(0.55 0.1 236);
-  --chart-5: oklch(0.68 0.12 78);
+  /* Categorical series colours. Unlike the rest of this file these are hex,
+     because they are the exact values that clear the data-viz checks (lightness
+     band, chroma floor, colourblind separation under simulated protan/deutan,
+     normal-vision separation, contrast vs the card surface) — re-expressing them
+     in OKLCH would round them off the validated points.
+     The previous brand-tinted set failed three of those checks: --chart-1 sat
+     below the lightness band, three slots read as grey (chroma < 0.10), and the
+     worst adjacent pair was indistinguishable even with full colour vision.
+     Assign these in fixed order and never cycle them; a sixth series folds into
+     "Other" rather than getting a generated hue.
+     Aqua, yellow and magenta fall under 3:1 against white, so any chart using
+     them must also show its numbers as text (direct labels or a table). */
+  --chart-1: #2a78d6; /* blue */
+  --chart-2: #eb6834; /* orange */
+  --chart-3: #1baf7a; /* aqua */
+  --chart-4: #eda100; /* yellow */
+  --chart-5: #e87ba4; /* magenta */
   --radius: 0.75rem;
   --sidebar: oklch(0.975 0.007 162);
   --sidebar-foreground: oklch(0.17 0.014 165);
@@ -117,11 +129,13 @@
   --border: oklch(1 0 0 / 11%);
   --input: oklch(1 0 0 / 15%);
   --ring: oklch(0.56 0.09 162);
-  --chart-1: oklch(0.56 0.09 162);
-  --chart-2: oklch(0.66 0.1 190);
-  --chart-3: oklch(0.72 0.12 128);
-  --chart-4: oklch(0.66 0.11 236);
-  --chart-5: oklch(0.76 0.12 78);
+  /* The same five hues re-stepped for the dark card surface — selected, not
+     flipped, and validated against it independently. All five clear 3:1 here. */
+  --chart-1: #3987e5; /* blue */
+  --chart-2: #d95926; /* orange */
+  --chart-3: #199e70; /* aqua */
+  --chart-4: #c98500; /* yellow */
+  --chart-5: #d55181; /* magenta */
   --sidebar: oklch(0.178 0.013 165);
   --sidebar-foreground: oklch(0.945 0.008 160);
   --sidebar-primary: oklch(0.56 0.09 162);

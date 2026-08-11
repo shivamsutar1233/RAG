@@ -1,161 +1,160 @@
 """
-Evaluation harness - adapted for Aether AI.
+Evaluation harness — command-line front end for the dashboard's evaluator.
 
-This script evaluates the Aether AI pipeline against the two golden sets
-from the internship project.
+Thin on purpose: every score comes from ``backend.evaluation``, the same module
+the ``/api/eval`` endpoints call, so a number printed here and a number on the
+Evaluation tab can never disagree.
 
-Faithfulness here = word-overlap between the retrieved chunk actually used
-and the golden answer (a crude proxy for what an LLM judge would check).
+This used to score answers by word overlap against a reference, which its own
+docstring called "a crude proxy for what an LLM judge would check". It is now a
+real LLM judge — RAGAS — run with whichever models the workspace is configured
+to use.
+
+Usage::
+
+    python evaluate.py                          # both bundled golden sets
+    python evaluate.py --testset my-questions   # a saved workspace test set
+    python evaluate.py --file eval/golden_v2_fixed.json
+    python evaluate.py --user <id> --generate 10
 """
 
+from __future__ import annotations
+
+import argparse
 import json
 import os
 import sys
-from typing import Dict
+import uuid
 
-# Add current directory to path to import Aether AI components
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from dotenv import load_dotenv
 
-from backend.main import setup_pipeline
-from backend.multi_rep_utils import restore_original_content
+load_dotenv()
+
+from backend.evaluation import (  # noqa: E402
+    METRIC_LABELS,
+    TestSet,
+    generate_testset,
+    list_testsets,
+    load_testset,
+    parse_testset,
+    run_evaluation,
+    save_testset,
+)
+from backend.main import setup_pipeline  # noqa: E402
+from backend.user_config import load_user_config  # noqa: E402
+from backend.workspace import Workspace  # noqa: E402
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 GOLDEN_V1 = os.path.join(PROJECT_ROOT, "eval", "golden_v1_flawed.json")
 GOLDEN_V2 = os.path.join(PROJECT_ROOT, "eval", "golden_v2_fixed.json")
 
 
-def word_overlap_faithfulness(retrieved_text: str, golden_answer: str) -> float:
-    """Crude faithfulness proxy: what fraction of the golden answer's
-    meaningful words are actually present in the retrieved chunk?"""
-    stop = {
-        "the",
-        "a",
-        "an",
-        "is",
-        "are",
-        "to",
-        "of",
-        "for",
-        "and",
-        "in",
-        "on",
-        "at",
-        "with",
-        "we",
-        "our",
-        "you",
-        "your",
-        "this",
-        "that",
-        "it",
-        "be",
-        "as",
-    }
-    golden_words = {w.strip(".,?!").lower() for w in golden_answer.split()} - stop
-    retrieved_words = {w.strip(".,?!").lower() for w in retrieved_text.split()} - stop
-    if not golden_words:
-        return 1.0
-    overlap = golden_words & retrieved_words
-    return len(overlap) / len(golden_words)
+def _load_file(path: str) -> TestSet:
+    name = os.path.splitext(os.path.basename(path))[0]
+    with open(path, encoding="utf-8") as handle:
+        return parse_testset(name, handle.read(), source="sample")
 
 
-def run_eval(golden_path: str, pipeline) -> Dict:
-    with open(golden_path) as f:
-        golden_set = json.load(f)
+def _print_report(report: dict) -> None:
+    print()
+    for row in report["rows"]:
+        scores = row.get("scores") or {}
+        faith = scores.get("faithfulness")
+        flag = "  ?  " if faith is None else (" OK  " if faith >= 0.6 else " LOW ")
+        detail = " ".join(f"{k}={v:.2f}" for k, v in sorted(scores.items()))
+        print(f"  [{flag}] {row['route'] or 'failed':<13} {row['question'][:60]}")
+        if detail:
+            print(f"          {detail}")
+        if row.get("error"):
+            print(f"          ERROR: {row['error']}")
 
-    results = []
-
-    query_analyzer = pipeline["query_analyzer"]
-    routing_retriever = pipeline["routing_retriever"]
-    question_answer_chain = pipeline["question_answer_chain"]
-
-    for item in golden_set:
-        query = item["question"]
-        golden_answer = item["golden_answer"]
-
-        # 1. Analyze and Route (simulate Aether AI's heavy path)
-        structured_query = query_analyzer.analyze(query)
-        route, _ = routing_retriever.determine_route(query)
-
-        if route == "simple":
-            # Force standard retrieval for rigorous evaluation
-            route = "standard"
-
-        # 2. Retrieve Documents
-        context_docs = routing_retriever.retrieve_for_route(structured_query.content_search, route)
-        context_docs = restore_original_content(context_docs)
-
-        # Combine retrieved context for the faithfulness check
-        retrieved_text = " ".join([doc.page_content for doc in context_docs])
-
-        # 3. Generate Answer
-        answer = question_answer_chain.invoke(
-            {
-                "context": context_docs,
-                "input": structured_query.content_search,
-                "chat_history": [],
-            }
-        )
-
-        # 4. Calculate Faithfulness
-        faithfulness = word_overlap_faithfulness(retrieved_text, golden_answer)
-        results.append(
-            {
-                "question": query,
-                "golden_answer": golden_answer,
-                "actual_answer": answer,
-                "faithfulness": round(faithfulness, 3),
-                "route_used": route,
-            }
-        )
-
-    avg_faithfulness = sum(r["faithfulness"] for r in results) / len(results)
-    return {"results": results, "avg_faithfulness": round(avg_faithfulness, 3)}
+    print("\n  " + "-" * 50)
+    for metric in report["metrics"]:
+        value = report["scores"].get(metric)
+        print(f"  {METRIC_LABELS[metric]:<24} {'—' if value is None else f'{value:.3f}'}")
 
 
-def main():
-    print("Initializing Aether AI Pipeline for Evaluation...")
-    try:
-        pipeline = setup_pipeline()
-    except Exception as e:
-        print(f"Failed to load pipeline: {e}")
-        print("Please make sure the dataset is in ./documents.")
-        print("Then run: python -m backend.ingest")
-        return
-
-    print("\n" + "=" * 70)
-    print("EVAL RUN 1: golden_v1_flawed.json (loosely-worded reference answers)")
-    print("=" * 70)
-    report_v1 = run_eval(GOLDEN_V1, pipeline)
-    for r in report_v1["results"]:
-        flag = "OK" if r["faithfulness"] >= 0.5 else "LOW"
-        print(
-            "  [{flag}] faithfulness={faith:.2f} | Route: {route} | {q}".format(
-                flag=flag, faith=r["faithfulness"], route=r["route_used"], q=r["question"]
-            )
-        )
-    print(f"\n  AVERAGE FAITHFULNESS (v1): {report_v1['avg_faithfulness']:.2f}")
-
-    print("\n" + "=" * 70)
-    print("EVAL RUN 2: golden_v2_fixed.json (grounded strictly in source docs)")
-    print("=" * 70)
-    report_v2 = run_eval(GOLDEN_V2, pipeline)
-    for r in report_v2["results"]:
-        flag = "OK" if r["faithfulness"] >= 0.5 else "LOW"
-        print(
-            "  [{flag}] faithfulness={faith:.2f} | Route: {route} | {q}".format(
-                flag=flag, faith=r["faithfulness"], route=r["route_used"], q=r["question"]
-            )
-        )
-    print(f"\n  AVERAGE FAITHFULNESS (v2): {report_v2['avg_faithfulness']:.2f}")
-
-    print("\n" + "=" * 70)
-    print(
-        f"RESULT: {report_v1['avg_faithfulness']:.2f} -> {report_v2['avg_faithfulness']:.2f} "
-        f"after fixing the golden set (not the retrieval/guardrail logic)."
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Evaluate the RAG pipeline with RAGAS.")
+    parser.add_argument("--user", default=None, help="Workspace to evaluate (default: local).")
+    parser.add_argument("--testset", help="Name of a saved test set in the workspace.")
+    parser.add_argument("--file", help="Path to a JSON/CSV test set.")
+    parser.add_argument(
+        "--generate",
+        type=int,
+        metavar="N",
+        help="Generate an N-question test set from the workspace's documents and save it.",
     )
-    print("=" * 70)
+    parser.add_argument("--list", action="store_true", help="List saved test sets and exit.")
+    args = parser.parse_args()
+
+    workspace = Workspace.for_user(args.user).ensure()
+
+    if args.list:
+        sets = list_testsets(workspace)
+        if not sets:
+            print("No saved test sets.")
+        for entry in sets:
+            print(
+                f"  {entry['name']:<28} {entry['size']:>3} questions  "
+                f"{'refs' if entry['has_references'] else 'no refs'}  ({entry['source']})"
+            )
+        return 0
+
+    print(f"Loading pipeline for workspace '{workspace.user_id}'...")
+    try:
+        config = load_user_config(workspace)
+        pipeline = setup_pipeline(workspace, config)
+    except Exception as exc:
+        print(f"Failed to load pipeline: {exc}", file=sys.stderr)
+        print(
+            "Upload documents and build the index first: python -m backend.ingest",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.generate:
+        name = f"generated-{uuid.uuid4().hex[:8]}"
+        items = generate_testset(pipeline, config, size=args.generate, log=print)
+        save_testset(workspace, TestSet(name=name, items=items, source="generated"))
+        print(f"\nSaved test set '{name}' with {len(items)} question(s).")
+        print(json.dumps(items, indent=2))
+        return 0
+
+    if args.testset:
+        testsets = [load_testset(workspace, args.testset)]
+    elif args.file:
+        testsets = [_load_file(args.file)]
+    else:
+        # The default run is still the v1-vs-v2 comparison the golden sets were
+        # built for: the point is that fixing the *reference answers* moves the
+        # score, without touching retrieval.
+        testsets = [_load_file(GOLDEN_V1), _load_file(GOLDEN_V2)]
+
+    reports = []
+    for testset in testsets:
+        print("\n" + "=" * 70)
+        print(f"EVAL: {testset.name}  ({len(testset.items)} questions)")
+        print("=" * 70)
+        report = run_evaluation(
+            pipeline, config, testset, run_id=str(uuid.uuid4()), log=print
+        )
+        _print_report(report)
+        reports.append((testset.name, report))
+
+    if len(reports) == 2:
+        print("\n" + "=" * 70)
+        for metric in reports[0][1]["metrics"]:
+            before = reports[0][1]["scores"].get(metric)
+            after = reports[1][1]["scores"].get(metric)
+            if before is None or after is None:
+                continue
+            print(f"  {METRIC_LABELS[metric]:<24} {before:.3f} -> {after:.3f}")
+        print("  (difference comes from the reference answers, not the retriever)")
+        print("=" * 70)
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

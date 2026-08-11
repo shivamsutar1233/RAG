@@ -189,20 +189,24 @@ class StorageClient:
             print(f"[storage] list_index_files failed: {exc}", file=sys.stderr)
             return []
 
-    # ── builds ────────────────────────────────────────────────────────────
+    # ── job files (builds, evals) ─────────────────────────────────────────
+    #
+    # Builds and evaluation runs store the same shape of thing — a status JSON
+    # and a log, one pair per run — so they share one set of accessors keyed by
+    # folder rather than a copy each.
 
-    def upload_build_file(self, filename: str, data: bytes) -> bool:
-        """Upload a build log or json to Storage."""
+    def upload_job_file(self, folder: str, filename: str, data: bytes) -> bool:
+        """Upload a run's log or json to *folder* in Storage."""
         if not self._storage:
             return False
         if len(data) > MAX_UPLOAD_BYTES:
             print(
-                f"[storage] Skipping build file '{filename}' — {len(data)} bytes "
+                f"[storage] Skipping {folder} file '{filename}' — {len(data)} bytes "
                 f"exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit.",
                 file=sys.stderr,
             )
             return False
-        path = self._remote_path("builds", filename)
+        path = self._remote_path(folder, filename)
         try:
             self._storage.upload(
                 path=path,
@@ -211,30 +215,39 @@ class StorageClient:
             )
             return True
         except Exception as exc:
-            print(f"[storage] upload_build_file '{path}' failed: {exc}", file=sys.stderr)
+            print(f"[storage] upload_job_file '{path}' failed: {exc}", file=sys.stderr)
             return False
 
-    def download_build_file(self, filename: str) -> Optional[bytes]:
-        """Download a build file from Storage."""
+    def download_job_file(self, folder: str, filename: str) -> Optional[bytes]:
+        """Download a run file from *folder* in Storage."""
         if not self._storage:
             return None
-        path = self._remote_path("builds", filename)
+        path = self._remote_path(folder, filename)
         try:
             return self._storage.download(path)
         except Exception as exc:
-            print(f"[storage] download_build_file '{path}' failed: {exc}", file=sys.stderr)
+            print(f"[storage] download_job_file '{path}' failed: {exc}", file=sys.stderr)
             return None
 
-    def list_build_files(self) -> list[dict]:
-        """List files in this user's builds folder in Storage."""
+    def list_job_files(self, folder: str) -> list[dict]:
+        """List files in this user's *folder* in Storage."""
         if not self._storage:
             return []
-        prefix = self._remote_path("builds")
+        prefix = self._remote_path(folder)
         try:
             return self._storage.list(prefix)
         except Exception as exc:
-            print(f"[storage] list_build_files failed: {exc}", file=sys.stderr)
+            print(f"[storage] list_job_files '{prefix}' failed: {exc}", file=sys.stderr)
             return []
+
+    def upload_build_file(self, filename: str, data: bytes) -> bool:
+        return self.upload_job_file("builds", filename, data)
+
+    def download_build_file(self, filename: str) -> Optional[bytes]:
+        return self.download_job_file("builds", filename)
+
+    def list_build_files(self) -> list[dict]:
+        return self.list_job_files("builds")
 
     # ── config ────────────────────────────────────────────────────────────
 
@@ -369,51 +382,77 @@ def sync_documents_from_storage(
     return downloaded > 0
 
 
-def sync_builds_to_storage(
+def sync_job_dir_to_storage(
     storage: Optional[StorageClient],
-    builds_dir: Path,
+    local_dir: Path,
+    folder: str,
 ) -> int:
-    """Upload every file in *builds_dir* to Storage.  Returns upload count."""
-    if storage is None or not builds_dir.is_dir():
+    """Upload every file in *local_dir* to *folder* in Storage.
+
+    Only the top level is walked: run metadata and logs are flat files, and
+    nested directories (eval test sets) are synced separately.
+    """
+    if storage is None or not local_dir.is_dir():
         return 0
     count = 0
-    for entry in sorted(builds_dir.iterdir()):
+    for entry in sorted(local_dir.iterdir()):
         if not entry.is_file():
             continue
-        data = entry.read_bytes()
-        if storage.upload_build_file(entry.name, data):
+        if storage.upload_job_file(folder, entry.name, entry.read_bytes()):
             count += 1
     return count
 
 
-def sync_builds_from_storage(
+def sync_job_dir_from_storage(
     storage: Optional[StorageClient],
-    builds_dir: Path,
+    local_dir: Path,
+    folder: str,
 ) -> bool:
-    """Pull build files from Storage into *builds_dir*."""
+    """Pull run files from *folder* in Storage into *local_dir*."""
     if storage is None:
         return False
-    remote_files = storage.list_build_files()
+    remote_files = storage.list_job_files(folder)
     if not remote_files:
         return False
 
-    builds_dir.mkdir(parents=True, exist_ok=True)
+    local_dir.mkdir(parents=True, exist_ok=True)
     downloaded = 0
     for entry in remote_files:
         name = entry.get("name", "")
         if not name or name.startswith("."):
             continue
-        local_path = builds_dir / name
+        local_path = local_dir / name
         if local_path.exists():
             continue
-        data = storage.download_build_file(name)
+        data = storage.download_job_file(folder, name)
         if data:
             local_path.write_bytes(data)
             downloaded += 1
 
     if downloaded:
-        print(f"☁️  [Storage] Pulled {downloaded} build file(s) from cloud.")
+        print(f"☁️  [Storage] Pulled {downloaded} {folder} file(s) from cloud.")
     return downloaded > 0
+
+
+def sync_builds_to_storage(storage: Optional[StorageClient], builds_dir: Path) -> int:
+    return sync_job_dir_to_storage(storage, builds_dir, "builds")
+
+
+def sync_builds_from_storage(storage: Optional[StorageClient], builds_dir: Path) -> bool:
+    return sync_job_dir_from_storage(storage, builds_dir, "builds")
+
+
+def sync_evals_to_storage(storage: Optional[StorageClient], evals_dir: Path) -> int:
+    """Upload eval run metadata/logs plus the saved test sets."""
+    count = sync_job_dir_to_storage(storage, evals_dir, "evals")
+    count += sync_job_dir_to_storage(storage, evals_dir / "testsets", "evals/testsets")
+    return count
+
+
+def sync_evals_from_storage(storage: Optional[StorageClient], evals_dir: Path) -> bool:
+    runs = sync_job_dir_from_storage(storage, evals_dir, "evals")
+    sets = sync_job_dir_from_storage(storage, evals_dir / "testsets", "evals/testsets")
+    return runs or sets
 
 
 def sync_config_from_storage(

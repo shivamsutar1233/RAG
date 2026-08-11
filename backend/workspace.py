@@ -80,11 +80,22 @@ class Workspace:
     def builds_dir(self) -> Path:
         return self.root / "builds"
 
+    @property
+    def evals_dir(self) -> Path:
+        """Evaluation run metadata and logs, one pair per run."""
+        return self.root / "evals"
+
+    @property
+    def testsets_dir(self) -> Path:
+        """Saved question sets an evaluation run can be scored against."""
+        return self.evals_dir / "testsets"
+
     def ensure(self) -> "Workspace":
         """Create the directories. Safe to call repeatedly."""
         self.documents_dir.mkdir(parents=True, exist_ok=True)
         self.index_dir.mkdir(parents=True, exist_ok=True)
         self.builds_dir.mkdir(parents=True, exist_ok=True)
+        self.testsets_dir.mkdir(parents=True, exist_ok=True)
         return self
 
     @property
@@ -155,6 +166,29 @@ class Workspace:
 
         storage = get_storage_client(self.user_id, token)
         return sync_builds_from_storage(storage, self.builds_dir)
+
+    def sync_evals_from_storage(self, token: Optional[str]) -> bool:
+        """Pull evaluation runs and saved test sets from Supabase Storage."""
+        if not token:
+            return False
+        from .storage import get_storage_client, sync_evals_from_storage
+
+        storage = get_storage_client(self.user_id, token)
+        return sync_evals_from_storage(storage, self.evals_dir)
+
+    def sync_evals_to_storage(self, token: Optional[str]) -> int:
+        """Push evaluation runs and saved test sets to Supabase Storage.
+
+        Called on its own after a run finishes rather than via
+        ``sync_to_storage`` — an eval changes nothing about the documents or
+        the index, so re-uploading those would be wasted bandwidth.
+        """
+        if not token:
+            return 0
+        from .storage import get_storage_client, sync_evals_to_storage
+
+        storage = get_storage_client(self.user_id, token)
+        return sync_evals_to_storage(storage, self.evals_dir)
 
     def sync_to_storage(self, token: Optional[str]) -> None:
         """Push local documents + index + config + builds to Supabase Storage."""

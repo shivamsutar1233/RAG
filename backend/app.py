@@ -268,6 +268,73 @@ class ChatResponse(BaseModel):
     answer at all."""
 
 
+class TestSetSummary(BaseModel):
+    name: str
+    source: str
+    size: int
+    has_references: bool
+    metrics: List[str]
+
+
+class TestSetCreateRequest(BaseModel):
+    name: str
+    # Either raw JSON/CSV text (an upload or a paste)...
+    content: Optional[str] = None
+    # ...or a plain list of questions, which is how the dashboard sends the ones
+    # a user picked out of their chat history. Those have no reference answers,
+    # so such a set is scored on the reference-free metrics only.
+    questions: Optional[List[str]] = None
+    source: str = "uploaded"
+
+
+class GenerateTestSetRequest(BaseModel):
+    name: str
+    size: int = 10
+
+
+class EvalRunRequest(BaseModel):
+    testset: str
+
+
+class EvalRow(BaseModel):
+    question: str
+    ground_truth: Optional[str] = None
+    answer: Optional[str] = None
+    contexts: List[str] = []
+    route: Optional[str] = None
+    grounded: Optional[bool] = None
+    latency_ms: int = 0
+    scores: dict = {}
+    error: Optional[str] = None
+
+
+class EvalRun(BaseModel):
+    """One evaluation run. Also used for test set generation jobs, which share
+    the run machinery but carry `kind="generate"` and no scores."""
+
+    id: str
+    kind: str = "eval"
+    status: str
+    started_at: str
+    completed_at: Optional[str] = None
+    testset: Optional[str] = None
+    testset_source: Optional[str] = None
+    testset_size: int = 0
+    has_references: bool = False
+    metrics: List[str] = []
+    llm_provider: Optional[str] = None
+    llm_model: Optional[str] = None
+    embedding_provider: Optional[str] = None
+    embedding_model: Optional[str] = None
+    judge_warning: Optional[str] = None
+    scores: dict = {}
+    error: Optional[str] = None
+
+
+class EvalRunDetail(EvalRun):
+    rows: List[EvalRow] = []
+
+
 class ConfigUpdateRequest(BaseModel):
     routing_method: str
     reranker_provider: str
@@ -821,14 +888,14 @@ def list_builds(user: CurrentUser = Depends(get_current_user)):
     return {"builds": builds}
 
 
-@app.get("/api/builds/{build_id}/stream")
-async def stream_build_logs(build_id: str, user: CurrentUser = Depends(get_current_user)):
-    workspace = current_workspace(user)
-    log_file = workspace.builds_dir / f"{build_id}.log"
-    meta_file = workspace.builds_dir / f"{build_id}.json"
+def _stream_log(log_file: Path, meta_file: Path) -> StreamingResponse:
+    """Tail a job's log over SSE until its status JSON leaves 'running'.
 
+    Shared by build and evaluation runs: both write a log beside a status file
+    and both are followed live by the dashboard.
+    """
     if not meta_file.exists():
-        raise HTTPException(status_code=404, detail="Build not found.")
+        raise HTTPException(status_code=404, detail="Run not found.")
 
     async def log_generator():
         # Open file in read mode. It might not exist immediately if the thread hasn't opened it yet.
@@ -860,6 +927,352 @@ async def stream_build_logs(build_id: str, user: CurrentUser = Depends(get_curre
                     await asyncio.sleep(0.5)
 
     return StreamingResponse(log_generator(), media_type="text/event-stream")
+
+
+@app.get("/api/builds/{build_id}/stream")
+async def stream_build_logs(build_id: str, user: CurrentUser = Depends(get_current_user)):
+    workspace = current_workspace(user)
+    safe_id = os.path.basename(build_id)
+    return _stream_log(
+        workspace.builds_dir / f"{safe_id}.log",
+        workspace.builds_dir / f"{safe_id}.json",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Evaluation
+#
+# Runs reuse the build-job shape — a status JSON plus a log file per run, polled
+# and tailed by the dashboard — with two deliberate differences. An eval runs
+# in-process rather than as a subprocess, because the whole point is to score the
+# *live* cached pipeline and a subprocess would reload FAISS, BM25 and Flashrank
+# from scratch. And because there is no child process to signal, cancellation is
+# a threading.Event the run checks between questions.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ACTIVE_EVALS: Dict[str, threading.Event] = {}
+
+
+def _write_run_json(path: Path, data: dict) -> None:
+    """Write run metadata atomically.
+
+    The dashboard polls these files every few seconds while they are being
+    rewritten. A plain write can be read back half-finished, which surfaces as a
+    JSON parse error in the UI for no reason the user can act on.
+    """
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _running_run(evals_dir: Path) -> Optional[str]:
+    """Id of the run currently in progress for this workspace, if any."""
+    if not evals_dir.is_dir():
+        return None
+    for path in evals_dir.glob("*.json"):
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if meta.get("status") == "running":
+            return meta.get("id")
+    return None
+
+
+def _run_eval_job(
+    workspace: Workspace,
+    run_id: str,
+    token: Optional[str],
+    kind: str,
+    body,
+    **meta_extra,
+) -> None:
+    """Scaffolding shared by evaluation runs and test set generation.
+
+    Owns the log file, the status JSON, the cancel token and the storage sync;
+    *body* does the actual work and returns fields to merge into the report.
+    """
+    workspace.ensure()
+    log_file = workspace.evals_dir / f"{run_id}.log"
+    meta_file = workspace.evals_dir / f"{run_id}.json"
+
+    cancel = threading.Event()
+    ACTIVE_EVALS[run_id] = cancel
+
+    def say(message: str) -> None:
+        with open(log_file, "a", encoding="utf-8") as handle:
+            handle.write(f"{message}\n")
+
+    meta: dict = {
+        "id": run_id,
+        "kind": kind,
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": None,
+        "error": None,
+        **meta_extra,
+    }
+    log_file.write_text("", encoding="utf-8")
+    _write_run_json(meta_file, meta)
+
+    try:
+        meta.update(body(say, cancel))
+    except Exception as exc:
+        print(f"[API ERROR] {kind} run {run_id} failed: {exc}", file=sys.stderr)
+        meta["status"] = "failed"
+        meta["error"] = str(exc)[:300]
+        say(f"[ERROR] {exc}")
+    finally:
+        meta["completed_at"] = datetime.now(timezone.utc).isoformat()
+        if meta.get("status") == "running":
+            # Reached only if body() returned without setting a terminal status,
+            # or the process was restarted mid-run.
+            meta["status"] = "failed"
+            meta["error"] = meta.get("error") or "Interrupted"
+
+        # Log first, status second. The SSE tailer closes the stream as soon as
+        # the status leaves "running", so anything written after that write can
+        # be lost from the live view.
+        say("")
+        say(f"[done] {meta['status']}")
+        _write_run_json(meta_file, meta)
+        ACTIVE_EVALS.pop(run_id, None)
+        try:
+            workspace.sync_evals_to_storage(token)
+        except Exception as exc:
+            print(f"[API WARN] Eval storage sync failed: {exc}", file=sys.stderr)
+
+
+def _run_evaluation_background(
+    workspace: Workspace, testset_name: str, run_id: str, token: Optional[str]
+) -> None:
+    def body(say, cancel) -> dict:
+        from .evaluation import load_testset, run_evaluation
+
+        testset = load_testset(workspace, testset_name)
+        config = load_user_config(workspace, token)
+        pipeline = pipelines.get(workspace)
+        return run_evaluation(
+            pipeline, config, testset, run_id=run_id, cancel=cancel, log=say
+        )
+
+    _run_eval_job(workspace, run_id, token, "eval", body, testset=testset_name)
+
+
+def _run_generation_background(
+    workspace: Workspace, name: str, size: int, run_id: str, token: Optional[str]
+) -> None:
+    def body(say, cancel) -> dict:
+        from .evaluation import TestSet, generate_testset, save_testset
+
+        config = load_user_config(workspace, token)
+        pipeline = pipelines.get(workspace)
+        items = generate_testset(pipeline, config, size=size, log=say)
+        if cancel.is_set():
+            return {"status": "cancelled"}
+        save_testset(workspace, TestSet(name=name, items=items, source="generated"))
+        say(f"Saved test set '{name}'.")
+        return {"status": "completed", "testset_size": len(items)}
+
+    _run_eval_job(workspace, run_id, token, "generate", body, testset=name)
+
+
+@app.get("/api/eval/testsets", response_model=List[TestSetSummary])
+def list_eval_testsets(user: CurrentUser = Depends(get_current_user)):
+    from .evaluation import list_testsets
+
+    workspace = current_workspace(user)
+    workspace.sync_evals_from_storage(user.token)
+    return list_testsets(workspace)
+
+
+@app.post("/api/eval/testsets", response_model=TestSetSummary)
+def create_eval_testset(
+    request: TestSetCreateRequest,
+    user: CurrentUser = Depends(get_current_user),
+):
+    """Save an uploaded/pasted test set, or one built from chat history."""
+    from .evaluation import TestSet, parse_testset, save_testset
+
+    workspace = current_workspace(user)
+    try:
+        if request.questions:
+            items = [{"question": q.strip()} for q in request.questions if q.strip()]
+            if not items:
+                raise ValueError("No questions supplied.")
+            testset = TestSet(name=request.name, items=items, source=request.source)
+        elif request.content:
+            testset = parse_testset(request.name, request.content, request.source)
+        else:
+            raise ValueError("Provide either 'content' or 'questions'.")
+        save_testset(workspace, testset)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    workspace.sync_evals_to_storage(user.token)
+    return TestSetSummary(
+        name=testset.name,
+        source=testset.source,
+        size=len(testset.items),
+        has_references=testset.has_references,
+        metrics=list(testset.metrics()),
+    )
+
+
+@app.delete("/api/eval/testsets/{name}")
+def delete_eval_testset(name: str, user: CurrentUser = Depends(get_current_user)):
+    from .evaluation import testset_path
+
+    workspace = current_workspace(user)
+    try:
+        path = testset_path(workspace, name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"No test set named '{name}'.")
+    path.unlink()
+    return {"status": "success", "deleted": name}
+
+
+@app.post("/api/eval/testsets/generate")
+def generate_eval_testset(
+    request: GenerateTestSetRequest,
+    background_tasks: BackgroundTasks,
+    user: CurrentUser = Depends(get_current_user),
+):
+    """Write a test set from the workspace's own chunks. Returns a run id."""
+    from .evaluation import MAX_TESTSET_SIZE, testset_path
+
+    workspace = current_workspace(user)
+    try:
+        testset_path(workspace, request.name)  # validates the name
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not 1 <= request.size <= MAX_TESTSET_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Size must be between 1 and {MAX_TESTSET_SIZE}.",
+        )
+
+    # Sync so the caller learns the index is missing now, rather than from a
+    # failed job thirty seconds later.
+    require_pipeline(workspace, token=user.token)
+
+    if (active := _running_run(workspace.evals_dir)) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Run {active} is already in progress for this workspace.",
+        )
+
+    run_id = str(uuid.uuid4())
+    background_tasks.add_task(
+        _run_generation_background, workspace, request.name, request.size, run_id, user.token
+    )
+    return {"status": "success", "run_id": run_id}
+
+
+# Sync `def` for the same reason as chat_endpoint: it calls require_pipeline,
+# which loads FAISS off disk. On the event loop that would stall every other
+# request; on the threadpool it only costs this one.
+@app.post("/api/eval/run")
+def trigger_evaluation(
+    request: EvalRunRequest,
+    background_tasks: BackgroundTasks,
+    user: CurrentUser = Depends(get_current_user),
+):
+    """Start an evaluation run against a saved test set. Returns a run id."""
+    from .evaluation import load_testset
+
+    workspace = current_workspace(user)
+    try:
+        load_testset(workspace, request.testset)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    require_pipeline(workspace, token=user.token)
+
+    if (active := _running_run(workspace.evals_dir)) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Run {active} is already in progress for this workspace.",
+        )
+
+    run_id = str(uuid.uuid4())
+    background_tasks.add_task(
+        _run_evaluation_background, workspace, request.testset, run_id, user.token
+    )
+    return {"status": "success", "run_id": run_id}
+
+
+@app.get("/api/eval/runs", response_model=List[EvalRun])
+def list_eval_runs(user: CurrentUser = Depends(get_current_user)):
+    """Run summaries, newest first. Rows are omitted — the trend chart and the
+    history list only need the aggregates, and a run's rows carry every retrieved
+    chunk, which would make this response enormous."""
+    workspace = current_workspace(user)
+    workspace.sync_evals_from_storage(user.token)
+
+    runs = []
+    if workspace.evals_dir.is_dir():
+        for path in workspace.evals_dir.glob("*.json"):
+            try:
+                meta = json.loads(path.read_text(encoding="utf-8"))
+                meta.pop("rows", None)
+                runs.append(meta)
+            except Exception:
+                continue
+    runs.sort(key=lambda r: r.get("started_at", ""), reverse=True)
+    return runs
+
+
+@app.get("/api/eval/runs/{run_id}", response_model=EvalRunDetail)
+def get_eval_run(run_id: str, user: CurrentUser = Depends(get_current_user)):
+    workspace = current_workspace(user)
+    path = workspace.evals_dir / f"{os.path.basename(run_id)}.json"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Evaluation run not found.")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail="Run file is corrupt.") from exc
+
+
+@app.post("/api/eval/runs/{run_id}/cancel")
+def cancel_eval_run(run_id: str, user: CurrentUser = Depends(get_current_user)):
+    """Ask a run to stop. It finishes the question in flight, then exits."""
+    workspace = current_workspace(user)
+    safe_id = os.path.basename(run_id)
+
+    if (event := ACTIVE_EVALS.get(safe_id)) is not None:
+        event.set()
+
+    # Also flip a run left 'running' by a server restart, so the workspace is
+    # not blocked forever by a job no thread is working on.
+    meta_file = workspace.evals_dir / f"{safe_id}.json"
+    if meta_file.is_file() and event is None:
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            if meta.get("status") == "running":
+                meta["status"] = "cancelled"
+                meta["completed_at"] = datetime.now(timezone.utc).isoformat()
+                meta["error"] = "Cancelled by user"
+                _write_run_json(meta_file, meta)
+        except Exception:
+            pass
+
+    return {"status": "cancelled"}
+
+
+@app.get("/api/eval/runs/{run_id}/stream")
+async def stream_eval_logs(run_id: str, user: CurrentUser = Depends(get_current_user)):
+    workspace = current_workspace(user)
+    safe_id = os.path.basename(run_id)
+    return _stream_log(
+        workspace.evals_dir / f"{safe_id}.log",
+        workspace.evals_dir / f"{safe_id}.json",
+    )
 
 
 # Mounted last: a mount at "/" matches every path, so it must be registered after

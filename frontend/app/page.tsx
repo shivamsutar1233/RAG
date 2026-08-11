@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
-  FolderOpen, LogOut, MessageSquare, Moon, Network, Plus, Settings2, Sun, Trash2, X,
+  FlaskConical, FolderOpen, LogOut, MessageSquare, Moon, Network, Plus, Settings2, Sun,
+  Trash2, X,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { ApiError, api, fetchAuthConfig, type StatusResponse } from "@/lib/api";
@@ -17,17 +18,19 @@ import {
 } from "@/lib/chat-store";
 import { ChatView } from "@/components/views/chat-view";
 import { DocumentsView } from "@/components/views/documents-view";
+import { EvaluationView } from "@/components/views/evaluation-view";
 import { SettingsView } from "@/components/views/settings-view";
 import { StatusView } from "@/components/views/status-view";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 
-type Tab = "chat" | "docs" | "status" | "settings";
+type Tab = "chat" | "docs" | "eval" | "status" | "settings";
 
 const TABS: { id: Tab; label: string; icon: React.ElementType }[] = [
   { id: "chat", label: "Chat", icon: MessageSquare },
   { id: "docs", label: "Documents", icon: FolderOpen },
+  { id: "eval", label: "Evaluation", icon: FlaskConical },
   { id: "status", label: "Status", icon: Network },
   { id: "settings", label: "Settings", icon: Settings2 },
 ];
@@ -47,7 +50,7 @@ export default function Page() {
     if (typeof window !== "undefined") {
       const params = new URLSearchParams(window.location.search);
       const urlTab = params.get("tab") as Tab;
-      if (urlTab && ["chat", "docs", "status", "settings"].includes(urlTab)) {
+      if (urlTab && ["chat", "docs", "eval", "status", "settings"].includes(urlTab)) {
         setTab(urlTab);
       }
     }
@@ -347,13 +350,20 @@ export default function Page() {
 
       {/* Workspace */}
       <main className="min-w-0 flex-1 overflow-hidden">
-        {mounted && active && (
+        {/* Only the chat pane needs a session. Gating the whole workspace on one
+            meant a user with no sessions yet saw an empty screen on every tab. */}
+        {mounted && (
           <>
-            <div className={cn("h-full", tab !== "chat" && "hidden")}>
-              <ChatView session={active} onUpdate={updateActive} />
-            </div>
+            {active && (
+              <div className={cn("h-full", tab !== "chat" && "hidden")}>
+                <ChatView session={active} onUpdate={updateActive} />
+              </div>
+            )}
             <div className={cn("h-full", tab !== "docs" && "hidden")}>
               <DocumentsView status={status} onRefresh={refresh} />
+            </div>
+            <div className={cn("h-full", tab !== "eval" && "hidden")}>
+              <EvaluationView status={status} sessions={sessions} active={tab === "eval"} />
             </div>
             <div className={cn("h-full", tab !== "status" && "hidden")}>
               <StatusView status={status} />

@@ -70,6 +70,76 @@ export interface BuildMeta {
   error: string | null;
 }
 
+/** Metric keys the backend can report. Reference-based ones are absent when the
+ *  test set has no ground-truth answers. */
+export type EvalMetric =
+  | "faithfulness"
+  | "answer_relevancy"
+  | "context_precision"
+  | "context_recall"
+  | "factual_correctness";
+
+export const METRIC_LABELS: Record<EvalMetric, string> = {
+  faithfulness: "Faithfulness",
+  answer_relevancy: "Answer relevancy",
+  context_precision: "Context precision",
+  context_recall: "Context recall",
+  factual_correctness: "Factual correctness",
+};
+
+export const METRIC_HELP: Record<EvalMetric, string> = {
+  faithfulness: "Is the answer actually supported by the retrieved text? Low means hallucination.",
+  answer_relevancy: "Does the answer address the question that was asked?",
+  context_precision: "Were the retrieved chunks relevant? This grades the retriever, not the model.",
+  context_recall: "Did retrieval find everything the reference answer needed?",
+  factual_correctness: "Does the answer agree with the reference answer?",
+};
+
+export interface TestSetSummary {
+  name: string;
+  source: string;
+  size: number;
+  has_references: boolean;
+  metrics: EvalMetric[];
+}
+
+export interface EvalRow {
+  question: string;
+  ground_truth: string | null;
+  answer: string | null;
+  contexts: string[];
+  route: string | null;
+  grounded: boolean | null;
+  latency_ms: number;
+  scores: Partial<Record<EvalMetric, number>>;
+  error: string | null;
+}
+
+export interface EvalRun {
+  id: string;
+  kind: "eval" | "generate";
+  status: "running" | "completed" | "failed" | "cancelled";
+  started_at: string;
+  completed_at: string | null;
+  testset: string | null;
+  testset_source: string | null;
+  testset_size: number;
+  has_references: boolean;
+  metrics: EvalMetric[];
+  llm_provider: string | null;
+  llm_model: string | null;
+  embedding_provider: string | null;
+  embedding_model: string | null;
+  /** Set when the judge model is too weak to be trusted; shown as a banner. */
+  judge_warning: string | null;
+  scores: Partial<Record<EvalMetric, number | null>>;
+  error: string | null;
+}
+
+export interface EvalRunDetail extends EvalRun {
+  rows: EvalRow[];
+}
+
 export interface ChatResponse {
   answer: string;
   route: string;
@@ -276,4 +346,52 @@ export const api = {
 
   search: (q: string) =>
     request<{ results: SearchResult[] }>(`/api/search?q=${encodeURIComponent(q)}`),
+
+  // ── evaluation ───────────────────────────────────────────────────────────
+
+  listTestsets: () => request<TestSetSummary[]>("/api/eval/testsets"),
+
+  /** Save a test set from pasted/uploaded JSON or CSV text. */
+  createTestset: (name: string, content: string, source = "uploaded") =>
+    request<TestSetSummary>("/api/eval/testsets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, content, source }),
+    }),
+
+  /** Save a set of bare questions — used for questions lifted from chat history,
+   *  which have no reference answers and so score on fewer metrics. */
+  createTestsetFromQuestions: (name: string, questions: string[], source = "chat") =>
+    request<TestSetSummary>("/api/eval/testsets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, questions, source }),
+    }),
+
+  deleteTestset: (name: string) =>
+    request<{ status: string; deleted: string }>(
+      `/api/eval/testsets/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    ),
+
+  generateTestset: (name: string, size: number) =>
+    request<{ status: string; run_id: string }>("/api/eval/testsets/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, size }),
+    }),
+
+  runEval: (testset: string) =>
+    request<{ status: string; run_id: string }>("/api/eval/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ testset }),
+    }),
+
+  listEvalRuns: () => request<EvalRun[]>("/api/eval/runs"),
+
+  getEvalRun: (runId: string) => request<EvalRunDetail>(`/api/eval/runs/${runId}`),
+
+  cancelEvalRun: (runId: string) =>
+    request<{ status: string }>(`/api/eval/runs/${runId}/cancel`, { method: "POST" }),
 };
