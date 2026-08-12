@@ -90,6 +90,21 @@ class Workspace:
         """Saved question sets an evaluation run can be scored against."""
         return self.evals_dir / "testsets"
 
+    @property
+    def live_pending_dir(self) -> Path:
+        """Chat turns waiting to be scored, one small JSON each.
+
+        A file per sample rather than one shared queue file: the chat path only
+        ever creates, and the worker only ever deletes, so the two never contend
+        for a lock and a crash mid-write costs one sample instead of the queue.
+        """
+        return self.evals_dir / "live" / "pending"
+
+    @property
+    def live_scored_path(self) -> Path:
+        """Append-only log of scored chat turns, newest last."""
+        return self.evals_dir / "live" / "scored.jsonl"
+
     def ensure(self) -> "Workspace":
         """Create the directories. Safe to call repeatedly."""
         self.documents_dir.mkdir(parents=True, exist_ok=True)

@@ -158,6 +158,36 @@ export interface EvalRunDetail extends EvalRun {
   rows: EvalRow[];
 }
 
+/** One turn of real chat traffic, scored in the background after the fact. */
+export interface LiveTurn {
+  id: string;
+  at: string;
+  question: string;
+  answer: string;
+  route: string | null;
+  grounded: boolean | null;
+  latency_ms: number;
+  contexts: number;
+  scores: Partial<Record<EvalMetric, number>>;
+  scored_at: string | null;
+  judge: string | null;
+}
+
+export interface LiveQuality {
+  enabled: boolean;
+  /** Fraction of chat turns actually scored. 0 disables live evaluation. */
+  sample_rate: number;
+  metrics: EvalMetric[];
+  scored_total: number;
+  /** Turns queued but not yet scored — the worker's backlog. */
+  pending: number;
+  averages: Partial<Record<EvalMetric, number | null>>;
+  grounded_rate: number | null;
+  median_latency_ms: number | null;
+  judge: string | null;
+  recent: LiveTurn[];
+}
+
 export interface ChatResponse {
   answer: string;
   route: string;
@@ -412,6 +442,10 @@ export const api = {
     }),
 
   listEvalRuns: () => request<EvalRun[]>("/api/eval/runs"),
+
+  /** Rolling quality over real chat traffic. Reads what the background worker
+   *  has already scored — never scores on the request, so it is cheap to poll. */
+  liveQuality: (recent = 25) => request<LiveQuality>(`/api/eval/live?recent=${recent}`),
 
   getEvalRun: (runId: string) => request<EvalRunDetail>(`/api/eval/runs/${runId}`),
 

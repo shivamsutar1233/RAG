@@ -2,13 +2,14 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  AlertTriangle, ChevronDown, FlaskConical, Loader2, MessageSquare, Play,
+  Activity, AlertTriangle, ChevronDown, FlaskConical, Loader2, MessageSquare, Play,
   Sparkles, Trash2, Upload, X,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
   API_BASE, ApiError, METRIC_CALL_COST, METRIC_HELP, METRIC_LABELS, api,
-  type EvalMetric, type EvalRun, type EvalRunDetail, type StatusResponse, type TestSetSummary,
+  type EvalMetric, type EvalRun, type EvalRunDetail, type LiveQuality,
+  type StatusResponse, type TestSetSummary,
 } from "@/lib/api";
 import { accessToken } from "@/lib/supabase";
 import type { Session } from "@/lib/sessions";
@@ -114,6 +115,8 @@ export function EvaluationView({ status, sessions, active }: Props) {
   const [loaded, setLoaded] = useState(false);
   // null means "everything this set supports" — the backend's own default.
   const [chosenMetrics, setChosenMetrics] = useState<EvalMetric[] | null>(null);
+  const [live, setLive] = useState<LiveQuality | null>(null);
+  const [showFeed, setShowFeed] = useState(false);
 
   const fileRef = useRef<HTMLInputElement>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
@@ -127,9 +130,16 @@ export function EvaluationView({ status, sessions, active }: Props) {
 
   const refresh = useCallback(async () => {
     try {
-      const [sets, runList] = await Promise.all([api.listTestsets(), api.listEvalRuns()]);
+      const [sets, runList, liveQuality] = await Promise.all([
+        api.listTestsets(),
+        api.listEvalRuns(),
+        // Never blocks the rest of the tab: live monitoring is a nice-to-have
+        // next to the batch scorecard, not a reason to show an error.
+        api.liveQuality().catch(() => null),
+      ]);
       setTestsets(sets);
       setRuns(runList);
+      setLive(liveQuality);
       setSelectedSet((current) => current || sets[0]?.name || "");
       setLoaded(true);
     } catch (err) {
@@ -354,6 +364,157 @@ export function EvaluationView({ status, sessions, active }: Props) {
                 <p className="text-sm font-medium">Judge model warning</p>
                 <p className="text-muted-foreground mt-0.5 text-sm">{detail.judge_warning}</p>
               </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {/* ── Live quality ──────────────────────────────────────────────── */}
+        {live?.enabled && (
+          <Card>
+            <CardHeader>
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div>
+                  <CardTitle className="text-base">Live quality</CardTitle>
+                  <CardDescription>
+                    Real questions people asked, scored in the background after the
+                    answer was sent. Chat is never made to wait for this.
+                  </CardDescription>
+                </div>
+                <div className="text-muted-foreground text-right text-xs">
+                  <p>
+                    sampling{" "}
+                    <span className="tabular font-medium">
+                      {Math.round(live.sample_rate * 100)}%
+                    </span>{" "}
+                    of turns
+                  </p>
+                  {live.pending > 0 && (
+                    <p className="mt-0.5 inline-flex items-center gap-1.5">
+                      <Loader2 className="size-3 animate-spin" />
+                      {live.pending} queued
+                    </p>
+                  )}
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {live.scored_total === 0 ? (
+                <p className="text-muted-foreground text-sm">
+                  {live.pending > 0
+                    ? "First turns are queued — scores appear here once the worker has graded them."
+                    : "No chat traffic scored yet. Ask something in Chat and it will show up here."}
+                </p>
+              ) : (
+                <>
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                    {live.metrics.map((metric) => (
+                      <ScoreTile
+                        key={metric}
+                        metric={metric}
+                        value={live.averages[metric]}
+                      />
+                    ))}
+                    <Card className="gap-0 py-5">
+                      <CardContent className="px-5">
+                        <div className="text-muted-foreground mb-2.5 flex items-center gap-2">
+                          <Activity className="size-4" />
+                          <span className="text-[11.5px] font-semibold tracking-wider uppercase">
+                            Grounded
+                          </span>
+                        </div>
+                        <p className="tabular text-2xl font-semibold tracking-tight">
+                          {live.grounded_rate === null
+                            ? "—"
+                            : `${Math.round(live.grounded_rate * 100)}%`}
+                        </p>
+                        <p className="text-muted-foreground mt-1.5 text-[11.5px] leading-snug">
+                          Answered from your documents rather than the model&apos;s own
+                          knowledge or the web.
+                        </p>
+                      </CardContent>
+                    </Card>
+                  </div>
+
+                  <div className="text-muted-foreground flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+                    <span>
+                      <span className="tabular font-medium">{live.scored_total}</span>{" "}
+                      turn{live.scored_total === 1 ? "" : "s"} scored
+                    </span>
+                    {live.median_latency_ms !== null && (
+                      <span>
+                        median answer{" "}
+                        <span className="tabular font-medium">
+                          {(live.median_latency_ms / 1000).toFixed(1)}s
+                        </span>
+                      </span>
+                    )}
+                    {live.judge && <span>judged by {live.judge}</span>}
+                    <button
+                      type="button"
+                      className="text-foreground underline underline-offset-2"
+                      onClick={() => setShowFeed((v) => !v)}
+                    >
+                      {showFeed ? "Hide" : "Show"} recent turns
+                    </button>
+                  </div>
+
+                  {showFeed && (
+                    <div className="divide-border divide-y rounded-lg border">
+                      {live.recent.map((turn) => (
+                        <div key={turn.id} className="px-4 py-3">
+                          <div className="flex items-start justify-between gap-3">
+                            <p className="min-w-0 flex-1 truncate text-sm font-medium">
+                              {turn.question}
+                            </p>
+                            <div className="flex shrink-0 items-center gap-3">
+                              {live.metrics.map((metric) => {
+                                const value = turn.scores?.[metric];
+                                const low =
+                                  typeof value === "number" && value < REVIEW_BELOW;
+                                return (
+                                  <span
+                                    key={metric}
+                                    title={METRIC_LABELS[metric]}
+                                    className="flex items-center gap-1 text-xs"
+                                  >
+                                    <span
+                                      aria-hidden
+                                      className="size-2 shrink-0 rounded-full"
+                                      style={{
+                                        backgroundColor: `var(--chart-${
+                                          METRIC_ORDER.indexOf(metric) + 1
+                                        })`,
+                                      }}
+                                    />
+                                    <span
+                                      className={cn(
+                                        "tabular",
+                                        low && "text-destructive font-medium",
+                                      )}
+                                    >
+                                      {fmt(value)}
+                                    </span>
+                                  </span>
+                                );
+                              })}
+                            </div>
+                          </div>
+                          <p className="text-muted-foreground mt-1 line-clamp-2 text-xs">
+                            {turn.answer}
+                          </p>
+                          <p className="text-muted-foreground mt-1 text-[11px]">
+                            {turn.route} · {turn.contexts} chunk
+                            {turn.contexts === 1 ? "" : "s"} ·{" "}
+                            {(turn.latency_ms / 1000).toFixed(1)}s
+                            {turn.grounded === false && " · not grounded"} ·{" "}
+                            {timeAgo(turn.at)}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
             </CardContent>
           </Card>
         )}

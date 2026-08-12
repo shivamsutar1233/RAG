@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 # Import pipeline components from main.py
 from .auth import AUTH_ENABLED, CurrentUser, auth_status, get_current_user
+from . import live_eval
 from .main import setup_pipeline
 from .providers import ConfigError, provider_catalog
 from .query_run import collect_sources, run_query, web_search
@@ -200,7 +201,16 @@ async def lifespan(app: FastAPI):
         print("💡 [API] RAG Pipeline loaded successfully.")
     except Exception as e:
         print(f"❌ [API] Pipeline not ready yet: {e}", file=sys.stderr)
-    yield
+
+    # Drains the live-evaluation spool in the background. Started after the
+    # pipeline warm-up because it needs neither the pipeline nor a request — it
+    # scores answers the chat path already produced.
+    live_worker = live_eval.LiveEvalWorker()
+    live_worker.start()
+    try:
+        yield
+    finally:
+        live_worker.stop()
 
 
 # Initialize FastAPI application
@@ -339,6 +349,37 @@ class EvalRun(BaseModel):
 
 class EvalRunDetail(EvalRun):
     rows: List[EvalRow] = []
+
+
+class LiveTurn(BaseModel):
+    """One scored turn of real chat traffic."""
+
+    id: str
+    at: str
+    question: str
+    answer: str
+    route: Optional[str] = None
+    grounded: Optional[bool] = None
+    latency_ms: int = 0
+    contexts: int = 0
+    scores: dict = {}
+    scored_at: Optional[str] = None
+    judge: Optional[str] = None
+
+
+class LiveQuality(BaseModel):
+    """Rolling quality over recent chat traffic, plus the worker's backlog."""
+
+    enabled: bool
+    sample_rate: float
+    metrics: List[str] = []
+    scored_total: int = 0
+    pending: int = 0
+    averages: dict = {}
+    grounded_rate: Optional[float] = None
+    median_latency_ms: Optional[int] = None
+    judge: Optional[str] = None
+    recent: List[LiveTurn] = []
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -520,6 +561,17 @@ def chat_endpoint(
         result = run_query(pipeline, request.message, request.history)
         sources = collect_sources(result.context_docs, result.web_results, result.grounded)
 
+        # Spool this turn for background scoring. A small file write, after the
+        # answer is already in hand, and it swallows its own failures — live
+        # evaluation must never cost the user a reply.
+        #
+        # The *original* message, not the rewritten query the analyzer produced:
+        # a live feed showing "coffee quality" when someone asked "what scale
+        # grades coffee quality?" is not showing real traffic, and relevance
+        # judged against the rewrite would grade the pipeline on its own
+        # paraphrase rather than on what the person actually wanted.
+        live_eval.enqueue(workspace, request.message, result)
+
         return ChatResponse(
             answer=result.answer or "",
             route=result.route,
@@ -584,6 +636,9 @@ async def chat_stream_endpoint(
             return
 
         # ── Phase 2: Token streaming ───────────────────────────────────────
+        # Tokens are accumulated as they go out so the finished answer can be
+        # spooled for live scoring; the streamed reply itself is unaffected.
+        streamed: list[str] = []
         if not result.streamable:
             # Graph routes already have the answer — yield it as one block.
             yield f"data: {json.dumps({'token': result.answer or '', 'done': False})}\n\n"
@@ -613,9 +668,16 @@ async def chat_stream_endpoint(
                 if isinstance(item, Exception):
                     yield f"data: {json.dumps({'error': 'An internal server error occurred while processing your request. Please check server logs.', 'done': True})}\n\n"
                     return
+                streamed.append(str(item))
                 yield f"data: {json.dumps({'token': item, 'done': False})}\n\n"
 
         # ── Phase 3: Final metadata event ─────────────────────────────────
+        # Spool after the last token has gone out, so scoring never sits between
+        # the user and their reply.
+        if streamed:
+            result.answer = "".join(streamed)
+        live_eval.enqueue(workspace, request.message, result)
+
         final_event = json.dumps({
             "done": True,
             "route": result.route,
@@ -1265,6 +1327,20 @@ def trigger_evaluation(
         request.metrics,
     )
     return {"status": "success", "run_id": run_id}
+
+
+@app.get("/api/eval/live", response_model=LiveQuality)
+def get_live_quality(
+    recent: int = 25,
+    user: CurrentUser = Depends(get_current_user),
+):
+    """Rolling quality of real chat traffic for this workspace.
+
+    Reads only what the worker has already written — it never scores on the
+    request, so this stays a cheap poll.
+    """
+    workspace = current_workspace(user)
+    return live_eval.summarise(workspace, recent=max(1, min(recent, 100)))
 
 
 @app.get("/api/eval/runs", response_model=List[EvalRun])
